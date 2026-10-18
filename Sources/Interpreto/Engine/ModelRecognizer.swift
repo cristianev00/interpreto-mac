@@ -38,6 +38,11 @@ final class ModelRecognizer: SpeechRecognizing {
     private var startTime = 0.0            // audio time of samples[0]
     private var time = 0.0                 // audio time fed so far
     private var speaking = false
+    /// The voice-activity detector currently hears speech (updated as events arrive, even while
+    /// a sentence is still being committed).
+    private var vadActive = false
+    private var loudness = 0.0             // loudest stretch of speech in the current sentence
+    private let gate = LoudnessGate()
     private var lastPartialAt = 0.0
     private var busy = false               // a transcription is running
     private var lastPartial = ""
@@ -76,8 +81,14 @@ final class ModelRecognizer: SpeechRecognizing {
         let stream = Recognizer.withPauseDetection(try input(format)) { [weak self] event in
             Task { @MainActor in
                 switch event {
-                case .started(let t): self?.speechStarted(at: t)
-                case .paused(let end, let long): await self?.paused(at: end, long: long)
+                case .started(let t):
+                    self?.vadActive = true
+                    if self?.speaking == false { self?.loudness = 0 }   // a new stretch of speech: its own loudness
+                    self?.speechStarted(at: t)
+                case .paused(let end, let long, let loudness):
+                    if !long { self?.vadActive = false }
+                    if let self { self.loudness = max(self.loudness, loudness) }
+                    await self?.paused(at: end, long: long)
                 }
             }
         }
@@ -149,6 +160,7 @@ final class ModelRecognizer: SpeechRecognizing {
 
     /// The voice-activity detector heard speech begin (it reports it a moment late).
     private func speechStarted(at t: Double) {
+        trace(String(format: "event: speech started at %.2f (speaking already: %@)", t, speaking ? "yes" : "no"))
         guard !speaking else { return }
         speaking = true
         trace(String(format: "speech starts at %.2f", t))
@@ -200,7 +212,9 @@ final class ModelRecognizer: SpeechRecognizing {
         let start = startTime
         samples.removeFirst(min(cut, samples.count))
         startTime = start + Double(cut) / Self.rate
-        speaking = false            // the next "speech started" event begins the next sentence
+        // If the speaker already went on talking while this was being handled, keep listening:
+        // otherwise the next "speech started" event begins the next sentence.
+        speaking = vadActive
         lastPartial = ""
         lastPartialAt = time
         onPartial("")
@@ -210,12 +224,22 @@ final class ModelRecognizer: SpeechRecognizing {
             if liveText == nil { text = Self.clean((try? await model.transcribe(head)) ?? "") }
             let refined = Self.clean((try? await finalModel.transcribe(head)) ?? "")
             let kept = Recognizer.normalized(refined).count, heard = Recognizer.normalized(text).count
-            if !refined.isEmpty, Double(kept) >= 0.7 * Double(heard) { text = refined }
-            else { trace("second pass dropped words; keeping: \(text)") }
+            // Keep the second pass unless it clearly dropped words, or invented many more than
+            // the live model heard (it can hallucinate sentences from background noise).
+            if !refined.isEmpty, Double(kept) >= 0.7 * Double(heard), Double(kept) <= 1.6 * Double(heard) + 4 { text = refined }
+            else { trace("second pass disagreed (\(kept) vs \(heard) letters); keeping: \(text)") }
         } else if liveText == nil {
             text = Self.clean((try? await model.transcribe(head)) ?? "")
         }
         trace(String(format: "commit %.2f–%.2f, %d samples left: %@", start, end, samples.count, text))
+        let heard = Self.speechLoudness(head)
+        loudness = 0
+        trace(String(format: "loudness %.4f for: %@", heard, text))
+        if !text.isEmpty, !gate.accept(heard) {           // quiet background voices: not for us
+            Diagnostics.event(String(format: "ignored background speech (%.4f): %@", heard, text))
+            trace("ignored background speech: \(text)")
+            return
+        }
         if !text.isEmpty {
             Diagnostics.event(String(format: "SENTENCE (%@) %.2f–%.2fs: %@", engine.rawValue, start, end, text))
             onCommit(UUID(), text, start, end)
@@ -223,6 +247,25 @@ final class ModelRecognizer: SpeechRecognizing {
     }
 
     static func clean(_ s: String) -> String { Recognizer.clean(s) }
+
+    /// How loud the speech in `samples` is: the level of its loudest 20 ms stretches (90th
+    /// percentile), so pauses don't lower it and a stretch containing the main speaker counts
+    /// as the main speaker's.
+    static func speechLoudness(_ samples: [Float]) -> Double {
+        let frame = 320
+        guard samples.count >= frame else { return 0 }
+        var levels: [Double] = []
+        levels.reserveCapacity(samples.count / frame)
+        var i = 0
+        while i + frame <= samples.count {
+            var sum: Float = 0
+            for j in i..<(i + frame) { sum += samples[j] * samples[j] }
+            levels.append(Double((sum / Float(frame)).squareRoot()))
+            i += frame
+        }
+        levels.sort()
+        return levels[min(levels.count - 1, levels.count * 9 / 10)]
+    }
 
     private func trace(_ t: String) {
         if Recognizer.debug { print(String(format: "  [%.2fs] ", time) + t) }

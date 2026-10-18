@@ -43,6 +43,8 @@ final class Recognizer {
     private var pauseAt: Double?                         // speech ended here; commit once heard
     private var pauseIsLong = false
     private var pauseDeadline: Task<Void, Never>?
+    private var loudness = 0.0                           // loudest stretch of speech in this sentence
+    private let gate = LoudnessGate()
 
     private var onPartial: (String) -> Void = { _ in }
     private var onCommit: (UUID, String, Double, Double) -> Void = { _, _, _, _ in }
@@ -83,7 +85,10 @@ final class Recognizer {
         }
         try await analyzer.prepareToAnalyze(in: format)
         let stream = Self.withPauseDetection(try input(format)) { [weak self] event in
-            if case .paused(let end, let long) = event { Task { @MainActor in self?.paused(at: end, long: long) } }
+            if case .started = event { Task { @MainActor in if self?.unclaimed.isEmpty ?? false { self?.loudness = 0 } } }
+            if case .paused(let end, let long, let loudness) = event {
+                Task { @MainActor in self?.loudness = max(self?.loudness ?? 0, loudness); self?.paused(at: end, long: long) }
+            }
         }
 
         resultsTask = Task { @MainActor [weak self] in
@@ -182,6 +187,14 @@ final class Recognizer {
         let text = unclaimed
         guard !text.isEmpty else { return }
         let n = Self.normalized(text).count
+        let heard = loudness
+        loudness = 0
+        if !gate.accept(heard) {                         // quiet background voices: not for us
+            taken += n
+            Diagnostics.event(String(format: "ignored background speech (%.4f): %@", heard, text))
+            onPartial(unclaimed)
+            return
+        }
         let id = UUID()
         pending.append(Pending(id: id, text: text, from: taken, to: taken + n))
         taken += n
@@ -215,9 +228,13 @@ final class Recognizer {
         pending.removeAll { $0.to <= confirmedChars + 1 }
         if let first = rest.first, let last = rest.last {
             let text = Self.clean(rest.map(\.text).joined())
-            if !text.isEmpty {
+            let heard = loudness
+            loudness = 0
+            if !text.isEmpty, gate.accept(heard) {
                 lastCommitEnd = last.end
                 onCommit(UUID(), text, first.start, last.end)
+            } else if !text.isEmpty {
+                Diagnostics.event(String(format: "ignored background speech (%.4f): %@", heard, text))
             }
         }
         // What Apple confirmed is no longer part of the live text.
@@ -292,7 +309,8 @@ extension Recognizer {
     /// Speech starting and pausing, as heard by the voice-activity detector.
     enum SpeechEvent: Sendable {
         case started(Double)                 // audio time speech began
-        case paused(Double, long: Bool)      // audio time speech ended; short (0.5 s) or long (1 s) pause
+        case paused(Double, long: Bool, loudness: Double)   // speech ended (audio time); short (0.5 s) or long (1 s) pause;
+                                                            // loudness: RMS of the speech since it started
     }
 
     /// Passes the audio through unchanged, reporting when speech starts and pauses. Uses Silero VAD
@@ -304,6 +322,7 @@ extension Recognizer {
             let task = Task.detached {
                 let vad = VoiceActivity.make()
                 var t = 0.0, lastSpeech: Double?, reported = 0, inSpeech = false
+                var energy = 0.0, frames = 0                 // loudness of the current stretch of speech
                 var recent: [Double] = []            // energy fallback: frame levels over the last ~4 s
                 for await buf in input {
                     cont.yield(buf)
@@ -329,18 +348,23 @@ extension Recognizer {
                         speech = rms > max(floor * 3, 0.0015)
                     }
                     if speech {
-                        if !inSpeech { inSpeech = true; onEvent(.started(max(0, start - VoiceActivity.lag))) }
+                        if !inSpeech {
+                            inSpeech = true; energy = 0; frames = 0
+                            onEvent(.started(max(0, start - VoiceActivity.lag)))
+                        }
+                        energy += Double(samples.reduce(0) { $0 + $1 * $1 }); frames += n
                         lastSpeech = t
                         reported = 0
                     } else if let s = lastSpeech {
                         // The detector holds "speech" a little past its end; measure from the true end.
                         let end = vad == nil ? s : max(0, s - VoiceActivity.lag)
                         if reported < 1, t - end >= pauseSeconds {
-                            onEvent(.paused(end, long: false)); reported = 1
+                            onEvent(.paused(end, long: false, loudness: (energy / Double(max(1, frames))).squareRoot())); reported = 1
                             inSpeech = false                 // speaking again reports a new start
                         }
                         if reported < 2, t - end >= longPauseSeconds {
-                            onEvent(.paused(end, long: true)); reported = 2; lastSpeech = nil; inSpeech = false
+                            onEvent(.paused(end, long: true, loudness: (energy / Double(max(1, frames))).squareRoot()))
+                            reported = 2; lastSpeech = nil; inSpeech = false
                         }
                     }
                 }
@@ -380,5 +404,27 @@ final class VoiceActivity {
         vad.acceptWaveform(samples: samples)
         while !vad.isEmpty() { vad.pop() }            // we only need the live state, not segments
         return vad.isSpeechDetected()
+    }
+}
+
+
+/// Tells the main speaker from quiet background voices (other people talking across the room):
+/// speech much quieter than the speaker's recent level isn't translated. The reference level
+/// halves every minute without accepted speech, so a new or more distant speaker is soon heard.
+@MainActor
+final class LoudnessGate {
+    static let ratio = 0.25            // ignore speech 12 dB quieter than the main speaker
+    static let floor = 0.0025          // and anything this quiet
+    private var foreground = 0.0
+    private var lastAccepted = Date.distantPast
+
+    func accept(_ level: Double) -> Bool {
+        guard level > 0 else { return true }           // unknown loudness: don't drop speech
+        let age = Date().timeIntervalSince(lastAccepted)
+        let reference = foreground * pow(0.5, min(age, 600) / 60)
+        guard level >= Self.floor, level >= reference * Self.ratio else { return false }
+        foreground = max(level, reference * 0.9)
+        lastAccepted = Date()
+        return true
     }
 }
