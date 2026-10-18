@@ -95,7 +95,10 @@ struct ContentView: View {
                 }
             }
         }
-        .task { await readiness.check() }
+        .task {
+            await readiness.check()
+            if CommandLine.arguments.contains("--diagnose") { live.recordDiagnostics() }
+        }
         .alert("Interpreto", isPresented: Binding(get: { live.message != nil }, set: { if !$0 { live.message = nil } })) {
             Button("OK") { live.message = nil }
         } message: {

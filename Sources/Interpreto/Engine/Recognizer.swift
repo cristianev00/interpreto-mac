@@ -14,9 +14,13 @@ final class Recognizer {
     struct Word { let text: String; let start: Double; let end: Double }
 
     /// A sentence that was committed at a pause and is waiting for Apple's confirmed text.
-    private struct Pending { let id: UUID; let start: Double; let end: Double; let text: String }
+    private struct Pending {
+        let id: UUID; let start: Double; let end: Double; let text: String
+        var confirmed: [Word] = []        // Apple may confirm one sentence in several pieces
+    }
 
-    nonisolated static let pauseSeconds = 0.5             // silence that ends a sentence
+    nonisolated static let pauseSeconds = 0.5             // a pause after a finished sentence (. ? ! 。)
+    nonisolated static let longPauseSeconds = 1.0         // a pause that ends a sentence regardless
     nonisolated static let debug = ProcessInfo.processInfo.environment["INTERPRETO_DEBUG"] != nil
 
     private var analyzer: SpeechAnalyzer?
@@ -26,6 +30,7 @@ final class Recognizer {
     private var committedThrough = 0.0                   // words starting before this are taken
     private var pending: [Pending] = []
     private var pauseAt: Double?                         // speech ended here; commit once heard
+    private var pauseIsLong = false
     private var pauseDeadline: Task<Void, Never>?
 
     private var onPartial: (String) -> Void = { _ in }
@@ -66,7 +71,7 @@ final class Recognizer {
         }
         try await analyzer.prepareToAnalyze(in: format)
         let stream = Self.withPauseDetection(try input(format)) { [weak self] speechEnd in
-            Task { @MainActor in self?.paused(at: speechEnd) }
+            Task { @MainActor in self?.paused(at: speechEnd.0, long: speechEnd.1) }
         }
 
         resultsTask = Task { @MainActor [weak self] in
@@ -108,29 +113,47 @@ final class Recognizer {
     private func heard(_ ws: [Word], through end: Double) {
         words = ws
         volatileEnd = end
-        if let p = pauseAt, end >= p { commitHeard(upTo: p + 0.25) }
+        if let p = pauseAt, end >= p {
+            if pauseIsLong || endsSentence(upTo: p + 0.25) { commitHeard(upTo: p + 0.25) }
+        }
         // Apple has processed well past the last word without hearing a new one: a pause, even
         // if the room is too noisy for the level-based detector.
-        else if let last = ws.last(where: { $0.start >= committedThrough - 0.05 }), end - last.end >= Self.pauseSeconds + 0.2 {
-            commitHeard(upTo: last.end + 0.05)
+        else if let last = ws.last(where: { $0.start >= committedThrough - 0.05 }) {
+            let gap = end - last.end
+            if gap >= Self.longPauseSeconds + 0.2 || (gap >= Self.pauseSeconds + 0.2 && endsSentence(upTo: last.end + 0.05)) {
+                commitHeard(upTo: last.end + 0.05)
+            }
         }
         onPartial(Self.join(ws.filter { $0.start >= committedThrough - 0.05 }))
     }
 
     /// The speaker paused. Commit the sentence once the recognizer has caught up with the pause
     /// (its live results trail the audio by a fraction of a second), or after 0.8 s at the latest.
-    private func paused(at speechEnd: Double) {
-        let line = String(format: "pause: speech ended %.2fs (recognizer heard through %.2fs)", speechEnd, volatileEnd)
+    /// A short pause commits a sentence only if it is finished (ends with . ? ! 。 ？ ！), so a
+    /// breath mid-sentence doesn't split it; a long pause commits whatever was said.
+    private func paused(at speechEnd: Double, long: Bool) {
+        let line = String(format: "pause (%@): speech ended %.2fs (recognizer heard through %.2fs)",
+                          long ? "long" : "short", speechEnd, volatileEnd)
         if Self.debug { print("  [\(line)]") }
         Diagnostics.event(line)
-        if volatileEnd >= speechEnd { commitHeard(upTo: speechEnd + 0.25); return }
+        if volatileEnd >= speechEnd {
+            if long || endsSentence(upTo: speechEnd + 0.25) { commitHeard(upTo: speechEnd + 0.25) }
+            return
+        }
         pauseAt = speechEnd
+        pauseIsLong = long
         pauseDeadline?.cancel()
         pauseDeadline = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(800))
             guard let self, !Task.isCancelled, let p = self.pauseAt else { return }
-            self.commitHeard(upTo: p + 0.25)
+            if self.pauseIsLong || self.endsSentence(upTo: p + 0.25) { self.commitHeard(upTo: p + 0.25) }
         }
+    }
+
+    private func endsSentence(upTo limit: Double) -> Bool {
+        let text = Self.join(words.filter { $0.start >= committedThrough - 0.05 && $0.start < limit })
+        guard let last = text.last(where: { !$0.isWhitespace }) else { return false }
+        return ".?!。？！…".contains(last)
     }
 
     private func commitHeard(upTo limit: Double) {
@@ -150,13 +173,18 @@ final class Recognizer {
     /// any confirmed words that no pause has claimed yet.
     private func confirmed(_ ws: [Word], through end: Double) {
         var claimed = Set<Int>()
-        for p in pending where p.start < end {
+        for i in pending.indices where pending[i].start < end {
+            let p = pending[i]
             let next = pending.first { $0.start > p.start }?.start ?? .infinity
             let mine = ws.enumerated().filter {
                 $0.element.start >= p.start - 0.3 && $0.element.start < next - 0.05 && $0.element.start < p.end + 0.3
             }
             claimed.formUnion(mine.map(\.offset))
-            let text = Self.join(mine.map(\.element))
+            pending[i].confirmed += mine.map(\.element)
+        }
+        // Sentences Apple has now confirmed completely: show the confirmed wording if it differs.
+        for p in pending where p.end <= end + 0.05 {
+            let text = Self.join(p.confirmed)
             if !text.isEmpty, Self.normalized(text) != Self.normalized(p.text) { onRevise(p.id, text) }
         }
         pending.removeAll { $0.end <= end + 0.05 }
@@ -204,10 +232,11 @@ final class Recognizer {
     /// Passes the audio through unchanged, calling `onPause(endOfSpeech)` when speech is followed
     /// by a pause. Speech is energy well above an adaptive noise floor.
     nonisolated static func withPauseDetection(_ input: AsyncStream<AnalyzerInput>,
-                                               onPause: @escaping @Sendable (Double) -> Void) -> AsyncStream<AnalyzerInput> {
+                                               onPause: @escaping @Sendable ((Double, Bool)) -> Void) -> AsyncStream<AnalyzerInput> {
         AsyncStream { cont in
             let task = Task.detached {
-                var t = 0.0, floor = 0.001, lastSpeech: Double?
+                var t = 0.0, lastSpeech: Double?, reported = 0      // pauses reported for lastSpeech: 0, 1 (short), 2 (long)
+                var recent: [Double] = []                  // frame levels over the last ~4 s
                 for await item in input {
                     cont.yield(item)
                     let buf = item.buffer
@@ -221,15 +250,18 @@ final class Recognizer {
                     }
                     let rms = (sum / Double(n)).squareRoot()
                     t += Double(n) / buf.format.sampleRate
-                    // Noise floor: drops to quiet stretches at once and rises ~6 %/s, so it settles
-                    // on a room's steady noise within seconds but stays far below speech.
-                    let dt = Double(n) / buf.format.sampleRate
-                    floor = max(rms < floor ? 0.7 * floor + 0.3 * rms : floor * (1 + 0.06 * dt), 0.00002)
-                    if rms > floor * 3.5 {
+                    // Noise floor: the typical quiet level of the last few seconds (20th percentile),
+                    // not the single quietest moment, which echo cancellation can push near zero.
+                    let frames = max(20, Int(4.0 * buf.format.sampleRate / Double(n)))
+                    recent.append(rms)
+                    if recent.count > frames { recent.removeFirst(recent.count - frames) }
+                    let floor = recent.count < 10 ? 0.001 : recent.sorted()[recent.count / 5]
+                    if rms > max(floor * 3, 0.0015) {
                         lastSpeech = t
-                    } else if let s = lastSpeech, t - s >= pauseSeconds {
-                        onPause(s)
-                        lastSpeech = nil
+                        reported = 0
+                    } else if let s = lastSpeech {
+                        if reported < 1, t - s >= pauseSeconds { onPause((s, false)); reported = 1 }
+                        if reported < 2, t - s >= longPauseSeconds { onPause((s, true)); reported = 2; lastSpeech = nil }
                     }
                 }
                 cont.finish()

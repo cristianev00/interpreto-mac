@@ -140,7 +140,11 @@ final class LiveController {
         Task {
             try? await Task.sleep(for: .milliseconds(600))
             start()
-            try? await Task.sleep(for: .seconds(30))
+            for _ in 0..<30 {
+                try? await Task.sleep(for: .seconds(1))
+                let input = mic.engine.inputNode
+                Diagnostics.event("mic health: \(mic.buffersReceived) buffers, engine running \(mic.engine.isRunning), echo cancellation \(input.isVoiceProcessingEnabled), listening \(isListening), starting \(isStarting), input \(input.outputFormat(forBus: 0))")
+            }
             stop()
             try? await Task.sleep(for: .seconds(2))
             Diagnostics.end()

@@ -29,6 +29,7 @@ final class Speaker {
     /// Interpreto's own engine on the chosen output device.
     func use(engine shared: AVAudioEngine?) {
         let target = shared ?? ownEngine
+        Diagnostics.event("voice: use \(shared == nil ? "own engine" : "microphone engine") (changing \(target !== engine))")
         guard target !== engine else { return }
         player.stop()
         backlog = 0

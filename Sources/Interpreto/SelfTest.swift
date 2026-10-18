@@ -22,6 +22,37 @@ enum Entry {
             Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
             RunLoop.main.run()
         }
+        if args.contains("--reusetest") {                    // app sequence: same mic, echo off then on
+            func note(_ t: String) {
+                let url = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/reusetest.txt")
+                let line = t + "\n"
+                if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+                else { try? Data(line.utf8).write(to: url) }
+            }
+            note("launched; mic permission status \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
+            Task { @MainActor in
+                note("task running")
+                let mic = Microphone(), speaker = Speaker()
+                let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
+                for echo in [false, true, true] {
+                    speaker.use(engine: echo ? mic.engine : nil)
+                    note("starting mic, echo \(echo)")
+                    let s: AsyncStream<AnalyzerInput>
+                    do { s = try mic.start(device: nil, format: fmt, echoCancellation: echo) } catch { note("start failed: \(error)"); continue }
+                    note("mic started")
+                    let drain = Task.detached { for await _ in s {} }
+                    try? await Task.sleep(for: .seconds(2))
+                    let line = "RESULT echo \(echo): \(mic.buffersReceived) buffers in 2 s, VP \(mic.engine.inputNode.isVoiceProcessingEnabled), input format \(mic.engine.inputNode.outputFormat(forBus: 0)), running \(mic.engine.isRunning)\n"
+                    print(line, terminator: "")
+                    let url = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/reusetest.txt")
+                    if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
+                    else { try? Data(line.utf8).write(to: url) }
+                    mic.stop(); drain.cancel()
+                }
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         if let i = args.firstIndex(of: "--echotest") {       // --echotest on|off seconds
             Task { @MainActor in await EchoTest.run(echo: args[i + 1] == "on", seconds: Double(args[i + 2]) ?? 20); exit(0) }
             RunLoop.main.run()
