@@ -18,7 +18,10 @@ final class Translator {
     func translate(_ text: String, _ d: Direction, glossary: Glossary) async throws -> String {
         let input = Self.applyGlossary(text, terms: glossary.terms(for: d))
         let response = try await session(d).translate(input)
-        return tidy(response.targetText)
+        var out = response.targetText
+        // Apple's translator occasionally answers in Traditional characters; keep Simplified.
+        if d == .enToZh { out = out.applyingTransform(StringTransform("Hant-Hans"), reverse: false) ?? out }
+        return tidy(out)
     }
 
     static func applyGlossary(_ text: String, terms: [(String, String)]) -> AttributedString {

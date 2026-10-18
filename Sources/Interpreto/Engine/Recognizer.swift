@@ -6,17 +6,22 @@ import Speech
 ///
 /// Apple confirms ("finalizes") a sentence only when it has heard more context, which in practice
 /// is often when the *next* sentence ends: 5–15 s late. Interpreto doesn't wait: when the speaker
-/// pauses, it commits the words heard so far (split by their timestamps) as a sentence, so it can be
+/// pauses, it commits the live (unconfirmed) text heard so far as a sentence, so it can be
 /// translated at once. When Apple's confirmed text arrives later, the sentence is quietly revised
 /// if any word changed.
+///
+/// Apple's live text comes as one block with no per-word timing (only confirmed text has word
+/// times), so committed words are tracked by text: `taken` counts the letters and digits of the
+/// live text already committed, and only what follows is shown as the sentence in progress.
 @MainActor
 final class Recognizer {
     struct Word { let text: String; let start: Double; let end: Double }
 
-    /// A sentence that was committed at a pause and is waiting for Apple's confirmed text.
+    /// A sentence committed at a pause, waiting for Apple's confirmed wording. `from`/`to` are its
+    /// position in the live text, counted in letters and digits.
     private struct Pending {
-        let id: UUID; let start: Double; let end: Double; let text: String
-        var confirmed: [Word] = []        // Apple may confirm one sentence in several pieces
+        let id: UUID; let text: String; var from: Int; var to: Int
+        var confirmed: [String] = []      // Apple may confirm one sentence in several pieces
     }
 
     nonisolated static let pauseSeconds = 0.5             // a pause after a finished sentence (. ? ! 。)
@@ -25,9 +30,12 @@ final class Recognizer {
 
     private var analyzer: SpeechAnalyzer?
     private var resultsTask: Task<Void, Never>?
-    private var words: [Word] = []                       // latest volatile words
-    private var volatileEnd = 0.0                        // audio time the volatile result covers
-    private var committedThrough = 0.0                   // words starting before this are taken
+    private var live = ""                                // Apple's current unconfirmed text
+    private var taken = 0                                // letters/digits of `live` already committed
+    private var volatileEnd = 0.0                        // audio time the live text covers
+    private var segmentStart = 0.0                       // audio time the live text starts
+    private var lastChange = 0.0                         // audio time the live text last changed
+    private var lastCommitEnd = 0.0
     private var pending: [Pending] = []
     private var pauseAt: Double?                         // speech ended here; commit once heard
     private var pauseIsLong = false
@@ -54,7 +62,8 @@ final class Recognizer {
         self.onPartial = onPartial
         self.onCommit = onCommit
         self.onRevise = onRevise
-        words = []; volatileEnd = 0; committedThrough = 0; pending = []; pauseAt = nil
+        live = ""; taken = 0; volatileEnd = 0; segmentStart = 0; lastChange = 0; lastCommitEnd = 0
+        pending = []; pauseAt = nil
 
         let transcriber = transcriber(for: d)
         let analyzer = SpeechAnalyzer(modules: [transcriber],
@@ -78,13 +87,13 @@ final class Recognizer {
             do {
                 for try await r in transcriber.results {
                     guard let self else { return }
-                    let ws = Self.words(r.text)
+                    let text = String(r.text.characters)
                     let line = String(format: "%@ %.2f–%.2fs: %@", r.isFinal ? "FINAL" : "volatile",
-                                      r.range.start.seconds, r.range.end.seconds, String(r.text.characters))
+                                      r.range.start.seconds, r.range.end.seconds, text)
                     if Self.debug { print("  [\(line)") }
                     Diagnostics.event("recognizer " + line)
-                    if r.isFinal { self.confirmed(ws, through: r.range.end.seconds) }
-                    else { self.heard(ws, through: r.range.end.seconds) }
+                    if r.isFinal { self.confirmed(Self.words(r.text)) }
+                    else { self.heard(text, from: r.range.start.seconds, through: r.range.end.seconds) }
                 }
             } catch is CancellationError {
             } catch { onError(error) }
@@ -95,7 +104,7 @@ final class Recognizer {
     /// Finishes the current audio (so the last sentence is confirmed) and stops.
     func stop() async {
         try? await analyzer?.finalizeAndFinishThroughEndOfInput()
-        commitHeard(upTo: .infinity)
+        commitLive(endingAt: volatileEnd)
         analyzer = nil
         resultsTask = nil
     }
@@ -109,22 +118,27 @@ final class Recognizer {
 
     // MARK: results
 
-    /// Volatile result: everything heard since Apple's last confirmed text.
-    private func heard(_ ws: [Word], through end: Double) {
-        words = ws
+    /// The part of the live text not yet committed as a sentence.
+    private var unclaimed: String { Self.clean(Self.split(live, after: taken).rest) }
+
+    /// Live (unconfirmed) result: everything heard since Apple's last confirmed text.
+    private func heard(_ text: String, from start: Double, through end: Double) {
+        if text != live { lastChange = end }
+        live = text
+        segmentStart = start
         volatileEnd = end
         if let p = pauseAt, end >= p {
-            if pauseIsLong || endsSentence(upTo: p + 0.25) { commitHeard(upTo: p + 0.25) }
-        }
-        // Apple has processed well past the last word without hearing a new one: a pause, even
-        // if the room is too noisy for the level-based detector.
-        else if let last = ws.last(where: { $0.start >= committedThrough - 0.05 }) {
-            let gap = end - last.end
-            if gap >= Self.longPauseSeconds + 0.2 || (gap >= Self.pauseSeconds + 0.2 && endsSentence(upTo: last.end + 0.05)) {
-                commitHeard(upTo: last.end + 0.05)
+            if pauseIsLong || Self.endsSentence(unclaimed) { commitLive(endingAt: p) }
+        } else if !unclaimed.isEmpty {
+            // Apple has processed well past its last change without hearing a new word: a pause,
+            // even if the room is too noisy for the level-based detector.
+            let gap = end - lastChange
+            if gap >= Self.longPauseSeconds + 0.2 || (gap >= Self.pauseSeconds + 0.2 && Self.endsSentence(unclaimed)) {
+                commitLive(endingAt: lastChange)
             }
         }
-        onPartial(Self.join(ws.filter { $0.start >= committedThrough - 0.05 }))
+        if Self.debug { print("    live (taken \(taken)): \(unclaimed)") }
+        onPartial(unclaimed)
     }
 
     /// The speaker paused. Commit the sentence once the recognizer has caught up with the pause
@@ -137,7 +151,7 @@ final class Recognizer {
         if Self.debug { print("  [\(line)]") }
         Diagnostics.event(line)
         if volatileEnd >= speechEnd {
-            if long || endsSentence(upTo: speechEnd + 0.25) { commitHeard(upTo: speechEnd + 0.25) }
+            if long || Self.endsSentence(unclaimed) { commitLive(endingAt: speechEnd) }
             return
         }
         pauseAt = speechEnd
@@ -146,59 +160,63 @@ final class Recognizer {
         pauseDeadline = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(800))
             guard let self, !Task.isCancelled, let p = self.pauseAt else { return }
-            if self.pauseIsLong || self.endsSentence(upTo: p + 0.25) { self.commitHeard(upTo: p + 0.25) }
+            if self.pauseIsLong || Self.endsSentence(self.unclaimed) { self.commitLive(endingAt: p) }
         }
     }
 
-    private func endsSentence(upTo limit: Double) -> Bool {
-        let text = Self.join(words.filter { $0.start >= committedThrough - 0.05 && $0.start < limit })
-        guard let last = text.last(where: { !$0.isWhitespace }) else { return false }
-        return ".?!。？！…".contains(last)
-    }
-
-    private func commitHeard(upTo limit: Double) {
+    /// Commits the unclaimed live text as a sentence.
+    private func commitLive(endingAt end: Double) {
         pauseAt = nil
         pauseDeadline?.cancel()
-        let ws = words.filter { $0.start >= committedThrough - 0.05 && $0.start < limit }
-        let text = Self.join(ws)
-        guard !text.isEmpty, let first = ws.first, let last = ws.last else { return }
+        let text = unclaimed
+        guard !text.isEmpty else { return }
+        let n = Self.normalized(text).count
         let id = UUID()
-        pending.append(Pending(id: id, start: first.start, end: last.end, text: text))
-        committedThrough = last.end
-        onCommit(id, text, first.start, last.end)
-        onPartial(Self.join(words.filter { $0.start >= committedThrough - 0.05 }))
+        pending.append(Pending(id: id, text: text, from: taken, to: taken + n))
+        taken += n
+        let start = max(lastCommitEnd, segmentStart)
+        let stop = max(end, start + 0.3)
+        lastCommitEnd = stop
+        onCommit(id, text, start, stop)
+        onPartial(unclaimed)
     }
 
-    /// Apple's confirmed text through `end`: revise committed sentences that changed, and commit
-    /// any confirmed words that no pause has claimed yet.
-    private func confirmed(_ ws: [Word], through end: Double) {
-        var claimed = Set<Int>()
-        for i in pending.indices where pending[i].start < end {
-            let p = pending[i]
-            let next = pending.first { $0.start > p.start }?.start ?? .infinity
-            let mine = ws.enumerated().filter {
-                $0.element.start >= p.start - 0.3 && $0.element.start < next - 0.05 && $0.element.start < p.end + 0.3
+    /// Apple's confirmed text (the start of the live text): revise committed sentences whose
+    /// wording changed, and commit confirmed words that no pause has claimed yet.
+    private func confirmed(_ ws: [Word]) {
+        var pos = 0
+        var rest: [Word] = []
+        for w in ws {
+            let n = Self.normalized(w.text).count
+            if pos < taken, let i = pending.lastIndex(where: { $0.from <= pos }) ?? pending.indices.first {
+                pending[i].confirmed.append(w.text)
+            } else if n > 0 || !rest.isEmpty {
+                rest.append(w)
             }
-            claimed.formUnion(mine.map(\.offset))
-            pending[i].confirmed += mine.map(\.element)
+            pos += n
         }
+        let confirmedChars = pos
         // Sentences Apple has now confirmed completely: show the confirmed wording if it differs.
-        for p in pending where p.end <= end + 0.05 {
-            let text = Self.join(p.confirmed)
+        for p in pending where p.to <= confirmedChars + 1 {
+            let text = Self.clean(p.confirmed.joined())
             if !text.isEmpty, Self.normalized(text) != Self.normalized(p.text) { onRevise(p.id, text) }
         }
-        pending.removeAll { $0.end <= end + 0.05 }
-        let rest = ws.enumerated()
-            .filter { !claimed.contains($0.offset) && $0.element.start >= committedThrough - 0.05 }
-            .map(\.element)
+        pending.removeAll { $0.to <= confirmedChars + 1 }
         if let first = rest.first, let last = rest.last {
-            let text = Self.join(rest)
+            let text = Self.clean(rest.map(\.text).joined())
             if !text.isEmpty {
-                committedThrough = last.end
+                lastCommitEnd = last.end
                 onCommit(UUID(), text, first.start, last.end)
             }
         }
-        committedThrough = max(committedThrough, end)
+        // What Apple confirmed is no longer part of the live text.
+        live = Self.split(live, after: confirmedChars).rest
+        taken = max(0, taken - confirmedChars)
+        for i in pending.indices {
+            pending[i].from = max(0, pending[i].from - confirmedChars)
+            pending[i].to = max(0, pending[i].to - confirmedChars)
+        }
+        onPartial(unclaimed)
     }
 
     // MARK: helpers
@@ -218,16 +236,47 @@ final class Recognizer {
         return out
     }
 
-    static func join(_ ws: [Word]) -> String {
-        var s = tidy(ws.map(\.text).joined())
+    /// Tidies a piece of recognized text for display: no leading punctuation, capitalized.
+    static func clean(_ text: String) -> String {
+        var s = tidy(text)
         while let f = s.first, ",.，。、;；:：".contains(f) { s.removeFirst(); s = s.trimmingCharacters(in: .whitespaces) }
         if let f = s.first, f.isLowercase { s = f.uppercased() + s.dropFirst() }
         return s
     }
 
+    /// Splits `text` after its first `n` letters and digits. If that lands inside a word (Apple
+    /// revised a word to be longer), the rest of that word stays with the first part.
+    static func split(_ text: String, after n: Int) -> (head: String, rest: String) {
+        guard n > 0 else { return ("", text) }
+        var count = 0
+        var idx = text.startIndex
+        while idx < text.endIndex, count < n {
+            let c = text[idx]
+            if c.isLetter || c.isNumber { count += 1 }
+            idx = text.index(after: idx)
+        }
+        while idx < text.endIndex, idx > text.startIndex,
+              text[idx].isLetter, text[text.index(before: idx)].isLetter, !text[idx].isCJK {
+            idx = text.index(after: idx)
+        }
+        return (String(text[..<idx]), String(text[idx...]))
+    }
+
+    static func endsSentence(_ text: String) -> Bool {
+        guard let last = text.last(where: { !$0.isWhitespace }) else { return false }
+        return ".?!。？！…".contains(last)
+    }
+
     static func normalized(_ s: String) -> String {
         s.lowercased().filter { $0.isLetter || $0.isNumber }
     }
+}
+
+private extension Character {
+    var isCJK: Bool { unicodeScalars.first.map { (0x3400...0x9FFF).contains($0.value) } ?? false }
+}
+
+extension Recognizer {
 
     /// Passes the audio through unchanged, calling `onPause(endOfSpeech)` when speech is followed
     /// by a pause. Speech is energy well above an adaptive noise floor.

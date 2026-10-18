@@ -93,7 +93,9 @@ enum SelfTest {
                 Task.detached {
                     for f in files {
                         guard let file = try? AVAudioFile(forReading: f) else { continue }
+                        print(String(format: "CLIP start %.2f", FedClock.shared.seconds))
                         await feed(file, to: format, cont)
+                        print(String(format: "CLIP end %.2f", FedClock.shared.seconds))
                         await MainActor.run { clipEnds.append(now()) }
                         await feedSilence(1.2, format, cont)
                     }
@@ -101,7 +103,9 @@ enum SelfTest {
                     cont.finish()
                 }
                 return stream
-            }, onPartial: { p in if Recognizer.debug { print(String(format: "    %.2fs partial: %@", now(), String(p.suffix(50)))) } },
+            }, onPartial: { p in
+                print(String(format: "PARTIAL %.2f %d %@", FedClock.shared.seconds, p.count, String(p.suffix(30))))
+            },
             onCommit: { id, text, _, wordEnd in
                 let heard = FedClock.shared.seconds
                 let speechEnd = wordEnd
