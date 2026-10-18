@@ -18,6 +18,10 @@ enum Entry {
             }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--voicetest") {      // --voicetest zh-CN|en-US "text" out-folder
+            Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
+            RunLoop.main.run()
+        }
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
         let files = args[(i + 2)...].map { URL(fileURLWithPath: $0) }
@@ -118,5 +122,69 @@ enum SelfTest {
             FedClock.shared.add(0.1)
             try? await Task.sleep(for: .milliseconds(100))
         }
+    }
+}
+
+
+/// Writes what the voice produces (raw) to raw.caf, and lists every buffer format it delivered.
+@MainActor
+enum VoiceTest {
+    static func run(language: String, text: String, folder: String) async {
+        let synth = AVSpeechSynthesizer()
+        let u = AVSpeechUtterance(string: text)
+        u.voice = Speaker.voices(for: language).first
+        print("all voices now:", AVSpeechSynthesisVoice.speechVoices().count)
+        try? await Task.sleep(for: .seconds(2))
+        print("all voices after 2 s:", AVSpeechSynthesisVoice.speechVoices().count)
+        Speaker.voices(for: language).prefix(4).forEach { print("  candidate:", $0.identifier, $0.quality.rawValue) }
+        print("voice:", u.voice.map { "\($0.name) \($0.identifier) quality \($0.quality.rawValue)" } ?? "none")
+        var file: AVAudioFile?
+        var formats = Set<String>()
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            synth.write(u) { buffer in
+                guard let pcm = buffer as? AVAudioPCMBuffer else { return }
+                if pcm.frameLength == 0 { done.resume(); return }
+                formats.insert(pcm.format.description)
+                if file == nil {
+                    file = try? AVAudioFile(forWriting: URL(fileURLWithPath: folder + "/raw.caf"), settings: pcm.format.settings,
+                                            commonFormat: pcm.format.commonFormat, interleaved: pcm.format.isInterleaved)
+                }
+                try? file?.write(from: pcm)
+            }
+        }
+        print("formats delivered:", formats.count)
+        // Compare old (fresh converter per buffer) vs new (mixer converts) at 48 kHz.
+        guard let raw = try? AVAudioFile(forReading: URL(fileURLWithPath: folder + "/raw.caf")) else { return }
+        let src = raw.processingFormat
+        let out48 = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
+        var chunks: [AVAudioPCMBuffer] = []
+        while raw.framePosition < raw.length {
+            let b = AVAudioPCMBuffer(pcmFormat: src, frameCapacity: 1024)!
+            try? raw.read(into: b, frameCount: 1024); chunks.append(b)
+        }
+        // old
+        let old = try! AVAudioFile(forWriting: URL(fileURLWithPath: folder + "/old.caf"), settings: out48.settings)
+        for b in chunks {
+            let conv = AVAudioConverter(from: src, to: out48)!
+            let o = AVAudioPCMBuffer(pcmFormat: out48, frameCapacity: AVAudioFrameCount(Double(b.frameLength) * 48_000 / src.sampleRate) + 64)!
+            var fed = false; var err: NSError?
+            conv.convert(to: o, error: &err) { _, st in if fed { st.pointee = .noDataNow; return nil }; fed = true; st.pointee = .haveData; return b }
+            try? old.write(from: o)
+        }
+        // new: player in the source format, mixer renders 48 kHz (offline)
+        let engine = AVAudioEngine(), player = AVAudioPlayerNode()
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: src)
+        try! engine.enableManualRenderingMode(.offline, format: out48, maximumFrameCount: 4096)
+        try! engine.start()
+        for b in chunks { player.scheduleBuffer(b, completionHandler: nil) }
+        player.play()
+        let new = try! AVAudioFile(forWriting: URL(fileURLWithPath: folder + "/new.caf"), settings: out48.settings)
+        let total = AVAudioFramePosition(Double(raw.length) * 48_000 / src.sampleRate)
+        let buf = AVAudioPCMBuffer(pcmFormat: engine.manualRenderingFormat, frameCapacity: 4096)!
+        while engine.manualRenderingSampleTime < total {
+            if (try? engine.renderOffline(4096, to: buf)) == .success { try? new.write(from: buf) } else { break }
+        }
+        print("wrote old.caf and new.caf")
     }
 }

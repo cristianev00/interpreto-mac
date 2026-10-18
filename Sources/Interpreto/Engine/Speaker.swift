@@ -9,8 +9,9 @@ final class Speaker {
     private let synth = AVSpeechSynthesizer()
     private let engine = AVAudioEngine()
     private let player = AVAudioPlayerNode()
-    private let format = AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!
-    private var converters: [String: AVAudioConverter] = [:]
+    /// The player runs in the voice's own format; the engine's mixer converts it to the device
+    /// smoothly. (Converting each small buffer separately leaves a click at every seam.)
+    private var format = AVAudioFormat(standardFormatWithSampleRate: 22_050, channels: 1)!
     private var deviceUID: String?
     private var backlog = 0.0
 
@@ -19,16 +20,31 @@ final class Speaker {
         engine.connect(player, to: engine.mainMixerNode, format: format)
     }
 
-    /// Voices for a language, best quality first.
+    /// Voices for a language, best first: Apple's neural (Siri-quality) voices, then premium and
+    /// enhanced ones, then the standard ones. Novelty and character voices are left out.
     static func voices(for language: String) -> [AVSpeechSynthesisVoice] {
         let prefix = String(language.prefix(2))
         return AVSpeechSynthesisVoice.speechVoices()
-            .filter { $0.language.hasPrefix(prefix) && (prefix != "zh" || $0.language == "zh-CN") }
-            .sorted { ($0.quality.rawValue, $0.name) > ($1.quality.rawValue, $1.name) }
+            .filter { v in
+                v.language.hasPrefix(prefix) && (prefix != "zh" || v.language == "zh-CN")
+                    && !v.voiceTraits.contains(.isNoveltyVoice) && !v.voiceTraits.contains(.isPersonalVoice)
+                    && !v.identifier.contains(".eloquence.") && !v.identifier.contains(".speech.synthesis.")
+            }
+            .sorted { (score($0), $0.name) > (score($1), $1.name) }
+    }
+
+    private static func score(_ v: AVSpeechSynthesisVoice) -> Int {
+        var s = v.quality.rawValue * 10
+        if v.identifier.contains("neural") { s += 100 }
+        if v.identifier.contains("super-compact") { s -= 5 }
+        if v.language == "en-US" || v.language == "zh-CN" { s += 3 }
+        return s
     }
 
     static func label(_ v: AVSpeechSynthesisVoice) -> String {
-        let q = v.quality == .premium ? " (Premium)" : v.quality == .enhanced ? " (Enhanced)" : ""
+        if v.identifier.contains("neural") { return "Natural (Siri quality) · \(v.language)" }
+        let q = v.quality == .premium ? " (Premium)" : v.quality == .enhanced ? " (Enhanced)"
+            : v.identifier.contains("super-compact") ? " (Basic)" : ""
         return "\(v.name)\(q) · \(v.language)"
     }
 
@@ -67,26 +83,20 @@ final class Speaker {
     }
 
     private func enqueue(_ pcm: AVAudioPCMBuffer) {
-        let key = pcm.format.description
-        if converters[key] == nil { converters[key] = AVAudioConverter(from: pcm.format, to: format) }
-        guard let conv = converters[key],
-              let out = AVAudioPCMBuffer(pcmFormat: format,
-                                         frameCapacity: AVAudioFrameCount(Double(pcm.frameLength) * format.sampleRate / pcm.format.sampleRate) + 64)
-        else { return }
-        var fed = false
-        var error: NSError?
-        conv.convert(to: out, error: &error) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }
-            fed = true; status.pointee = .haveData; return pcm
+        let f = pcm.format
+        if f.sampleRate != format.sampleRate || f.channelCount != format.channelCount || f.commonFormat != format.commonFormat {
+            player.stop()
+            engine.disconnectNodeOutput(player)
+            format = f
+            engine.connect(player, to: engine.mainMixerNode, format: f)
         }
-        guard error == nil, out.frameLength > 0 else { return }
         if !engine.isRunning {
             engine.prepare()
             do { try engine.start() } catch { return }
         }
-        let seconds = Double(out.frameLength) / format.sampleRate
+        let seconds = Double(pcm.frameLength) / f.sampleRate
         backlog += seconds
-        player.scheduleBuffer(out) { [weak self] in
+        player.scheduleBuffer(pcm) { [weak self] in
             DispatchQueue.main.async { self.map { $0.backlog = max(0, $0.backlog - seconds) } }
         }
         if !player.isPlaying { player.play() }

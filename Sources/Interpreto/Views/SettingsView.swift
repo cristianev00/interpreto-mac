@@ -50,8 +50,14 @@ private struct AudioSettings: View {
             } header: {
                 Text("Spoken Translation")
             } footer: {
-                Text("Use headphones so the microphone doesn’t hear the voice. To send it into Zoom or Teams, choose a virtual cable such as BlackHole. More natural voices: System Settings → Accessibility → Spoken Content → System Voice → Manage Voices.")
-                    .font(.caption).foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Use headphones so the microphone doesn’t hear the voice. To send it into Zoom or Teams, choose a virtual cable such as BlackHole.")
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("For a much more natural voice, download a free Premium or Enhanced voice (for Chinese: Lili or Tingting; for English: Ava, Zoe or Evan). Interpreto picks it up automatically.")
+                        Button("Get Voices…") { openVoiceSettings() }
+                    }
+                }
+                .font(.caption).foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
@@ -111,5 +117,15 @@ private struct GlossarySettings: View {
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+/// System Settings → Accessibility → Spoken Content, where Apple's voices are downloaded.
+@MainActor
+func openVoiceSettings() {
+    let urls = ["x-apple.systempreferences:com.apple.Accessibility-Settings.extension?SpokenContent",
+                "x-apple.systempreferences:com.apple.Accessibility-Settings.extension"]
+    for u in urls {
+        if let url = URL(string: u), NSWorkspace.shared.open(url) { return }
     }
 }
