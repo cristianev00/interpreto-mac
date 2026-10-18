@@ -63,11 +63,23 @@ final class LiveController {
             // talking. With headphones or a virtual cable chosen, there's no echo to cancel.
             let echo = defaults.bool(forKey: Pref.speak) && (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty
             speaker.use(engine: echo ? mic.engine : nil)
-            mic.onLevel = { [weak self] v in DispatchQueue.main.async { self?.level = v } }
+            var lastLevelLog = Date.distantPast
+            mic.onLevel = { [weak self] v in
+                DispatchQueue.main.async {
+                    self?.level = v
+                    if Diagnostics.isRecording, Date().timeIntervalSince(lastLevelLog) > 0.25 {
+                        lastLevelLog = Date()
+                        Diagnostics.event(String(format: "mic level %.4f%@", v, self?.speaker.isSpeaking == true ? "  (voice playing)" : ""))
+                    }
+                }
+            }
             do {
                 try await recognizer.start(
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
-                    input: { [mic] format in try mic.start(device: device, format: format, echoCancellation: echo) },
+                    input: { [mic] format in
+                        Diagnostics.event("listening: \(self.direction.label), echo cancellation \(echo), recognizer format \(format)")
+                        return Diagnostics.tap(try mic.start(device: device, format: format, echoCancellation: echo), format: format)
+                    },
                     onPartial: { [weak self] in self?.partialChanged($0) },
                     onCommit: { [weak self] id, text, start, end in self?.committed(id, text, start, end) },
                     onRevise: { [weak self] id, text in self?.revised(id, text) },
@@ -120,6 +132,23 @@ final class LiveController {
         }
     }
 
+    /// Help → Record Diagnostics: listen for 30 s while recording what the recognizer hears.
+    func recordDiagnostics() {
+        guard !Diagnostics.isRecording else { return }
+        if isListening { stop() }
+        Diagnostics.begin()
+        Task {
+            try? await Task.sleep(for: .milliseconds(600))
+            start()
+            try? await Task.sleep(for: .seconds(30))
+            stop()
+            try? await Task.sleep(for: .seconds(2))
+            Diagnostics.end()
+            if let f = Diagnostics.folder { NSWorkspace.shared.activateFileViewerSelecting([f]) }
+            message = "Diagnostics saved in “Interpreto Diagnostics” on your Desktop."
+        }
+    }
+
     func newSession() {
         if isListening { stop() }
         speaker.stop()
@@ -167,6 +196,7 @@ final class LiveController {
 
     /// A new sentence: translate it at once, then speak it if enabled.
     private func committed(_ id: UUID, _ text: String, _ start: Double, _ end: Double) {
+        Diagnostics.event(String(format: "SENTENCE %.2f–%.2fs: %@", start, end, text))
         let offset = (listeningSince ?? started).timeIntervalSince(started)
         session.items.append(Utterance(id: id, source: text, start: offset + start, end: offset + end))
         draftPending = nil
@@ -178,10 +208,11 @@ final class LiveController {
             update(id) { $0.translation = tr; $0.isTranslating = false }
             if defaults.bool(forKey: Pref.speak), !tr.isEmpty {
                 let voiceKey = d == .enToZh ? Pref.voiceZH : Pref.voiceEN
+                Diagnostics.event("voice queued: \(tr)")
                 let spoken = speaker.speak(tr, language: d.targetVoiceLanguage,
                                            voiceID: defaults.string(forKey: voiceKey),
                                            outputUID: defaults.string(forKey: Pref.outputUID),
-                                           onStart: { [weak self] in self?.speakingID = id })
+                                           onStart: { [weak self] in self?.speakingID = id; Diagnostics.event("voice starts playing") })
                 if !spoken { update(id) { $0.notSpoken = true } }
             }
             scheduleSave()

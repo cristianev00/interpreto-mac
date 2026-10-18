@@ -74,10 +74,10 @@ final class Recognizer {
                 for try await r in transcriber.results {
                     guard let self else { return }
                     let ws = Self.words(r.text)
-                    if Self.debug {
-                        print(String(format: "  [%@] %.2f–%.2fs: %@", r.isFinal ? "FINAL" : "volatile",
-                                     r.range.start.seconds, r.range.end.seconds, String(r.text.characters)))
-                    }
+                    let line = String(format: "%@ %.2f–%.2fs: %@", r.isFinal ? "FINAL" : "volatile",
+                                      r.range.start.seconds, r.range.end.seconds, String(r.text.characters))
+                    if Self.debug { print("  [\(line)") }
+                    Diagnostics.event("recognizer " + line)
                     if r.isFinal { self.confirmed(ws, through: r.range.end.seconds) }
                     else { self.heard(ws, through: r.range.end.seconds) }
                 }
@@ -120,7 +120,9 @@ final class Recognizer {
     /// The speaker paused. Commit the sentence once the recognizer has caught up with the pause
     /// (its live results trail the audio by a fraction of a second), or after 0.8 s at the latest.
     private func paused(at speechEnd: Double) {
-        if Self.debug { print(String(format: "  [pause] speech ended %.2fs (heard through %.2fs)", speechEnd, volatileEnd)) }
+        let line = String(format: "pause: speech ended %.2fs (recognizer heard through %.2fs)", speechEnd, volatileEnd)
+        if Self.debug { print("  [\(line)]") }
+        Diagnostics.event(line)
         if volatileEnd >= speechEnd { commitHeard(upTo: speechEnd + 0.25); return }
         pauseAt = speechEnd
         pauseDeadline?.cancel()

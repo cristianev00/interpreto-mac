@@ -204,8 +204,17 @@ enum EchoTest {
         print("echo cancellation:", echo)
         do {
             try await recognizer.start(direction: .enToZh, vocabulary: [],
-                input: { f in try mic.start(device: nil, format: f, echoCancellation: echo) },
-                onPartial: { _ in }, onCommit: { _, text, _, _ in print("  heard:", text) },
+                input: { f in
+                    let live = try mic.start(device: nil, format: f, echoCancellation: echo)
+                    // Also save exactly what the recognizer hears.
+                    let url = URL(fileURLWithPath: NSTemporaryDirectory() + "interpreto-heard-\(echo ? "on" : "off").caf")
+                    let file = try AVAudioFile(forWriting: url, settings: f.settings, commonFormat: f.commonFormat, interleaved: f.isInterleaved)
+                    print("saving heard audio to", url.path)
+                    return AsyncStream { cont in
+                        Task.detached { for await x in live { try? file.write(from: x.buffer); cont.yield(x) }; cont.finish() }
+                    }
+                },
+                onPartial: { _ in }, onCommit: { _, text, s, e in print(String(format: "  heard [%.1f–%.1fs]: %@", s, e, text)) },
                 onRevise: { _, text in print("  revised:", text) }, onError: { print("error", $0) })
         } catch { print("start failed", error); return }
         let lines = ["今天我们学习C语言中的指针。", "指针是一个存储地址的变量。", "请大家打开课本第三十页。", "我们来看第一个例子。"]
@@ -213,6 +222,7 @@ enum EchoTest {
         var k = 0
         while Date().timeIntervalSince(t0) < seconds {
             if !speaker.isSpeaking {
+                print(String(format: "  [voice starts at %.1fs]", Date().timeIntervalSince(t0)))
                 speaker.speak(lines[k % lines.count], language: "zh-CN", voiceID: nil, outputUID: nil, onStart: {})
                 k += 1
             }

@@ -27,6 +27,9 @@ struct InterpretoApp: App {
             CommandGroup(replacing: .newItem) {
                 Button("New Session") { live.newSession() }.keyboardShortcut("n")
             }
+            CommandGroup(after: .help) {
+                Button("Record Diagnostics (30 s)") { live.recordDiagnostics() }
+            }
             CommandMenu("Translate") {
                 Button(live.isListening ? "Stop Listening" : "Start Listening") { live.toggle() }
                     .keyboardShortcut("r")
