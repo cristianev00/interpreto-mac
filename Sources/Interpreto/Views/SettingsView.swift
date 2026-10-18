@@ -126,6 +126,36 @@ private struct DisplaySettings: View {
 private struct GlossarySettings: View {
     @AppStorage(Pref.glossary) private var glossary = ""
 
+    /// Adds the lines of `extra` whose English term isn't in the glossary yet.
+    static func merge(_ current: String, _ extra: String) -> String {
+        let have = Set(Glossary(text: current).pairs.map { $0.en.lowercased() })
+        let new = extra.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { line in
+                guard let en = Glossary(text: line).pairs.first?.en.lowercased() else { return false }
+                return !have.contains(en)
+            }
+        guard !new.isEmpty else { return current }
+        let base = current.trimmingCharacters(in: .whitespacesAndNewlines)
+        return (base.isEmpty ? "" : base + "\n") + new.joined(separator: "\n")
+    }
+
+    private func importGlossary() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.plainText, .commaSeparatedText, .text]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url,
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return }
+        glossary = Self.merge(glossary, text.replacingOccurrences(of: ",", with: " = "))
+    }
+
+    private func exportGlossary() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "Interpreto glossary.txt"
+        panel.allowedContentTypes = [.plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? glossary.write(to: url, atomically: true, encoding: .utf8)
+    }
+
     var body: some View {
         Form {
             Section {
@@ -142,7 +172,18 @@ private struct GlossarySettings: View {
             } header: {
                 Text("Terms")
             } footer: {
-                Text("One term per line: English = 中文. Works in both directions: the recognizer listens for these words and the translation always uses your wording. \(Glossary(text: glossary).pairs.count) terms.")
+                Text("One term per line: English = 中文. Works in both directions: terms heard as sound-alikes are corrected (“a bugger overflow” → “a buffer overflow”, 指真 → 指针), and the translation always uses your wording. \(Glossary(text: glossary).pairs.count) terms.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Section {
+                HStack {
+                    Button("Add C Programming Terms") { glossary = Self.merge(glossary, TermPacks.cProgramming) }
+                    Spacer()
+                    Button("Import…") { importGlossary() }
+                    Button("Export…") { exportGlossary() }.disabled(glossary.isEmpty)
+                }
+            } footer: {
+                Text("Import and export plain text files with one “English = 中文” pair per line, to share a glossary with students or colleagues.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

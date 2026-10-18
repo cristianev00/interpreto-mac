@@ -290,7 +290,16 @@ final class LiveController {
     }
 
     /// A new sentence: translate it at once, then speak it if enabled.
-    private func committed(_ id: UUID, _ text: String, _ start: Double, _ end: Double) {
+    /// Glossary terms the engine heard as sound-alikes are corrected ("a bugger overflow" →
+    /// "a buffer overflow", 指真 → 指针) before the sentence is shown and translated.
+    private func fixTerms(_ text: String, _ d: Direction) -> String {
+        let fixed = TermFixer.fix(text, terms: glossary.vocabulary(for: d), chinese: d == .zhToEn)
+        if fixed != text { Diagnostics.event("terms fixed: \(text) → \(fixed)") }
+        return fixed
+    }
+
+    private func committed(_ id: UUID, _ heard: String, _ start: Double, _ end: Double) {
+        let text = fixTerms(heard, direction)
         Diagnostics.event(String(format: "SENTENCE %.2f–%.2fs: %@", start, end, text))
         let offset = (listeningSince ?? started).timeIntervalSince(started)
         session.items.append(Utterance(id: id, source: text, start: offset + start, end: offset + end))
@@ -315,9 +324,10 @@ final class LiveController {
     }
 
     /// Apple confirmed different wording for a sentence: show it and re-translate (not re-spoken).
-    private func revised(_ id: UUID, _ text: String) {
-        update(id) { $0.source = text }
+    private func revised(_ id: UUID, _ heard: String) {
         let d = direction
+        let text = fixTerms(heard, d)
+        update(id) { $0.source = text }
         Task {
             let tr = await translate(text, d, before: id)
             update(id) { $0.translation = tr; $0.isTranslating = false }

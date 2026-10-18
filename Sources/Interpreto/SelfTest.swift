@@ -26,6 +26,26 @@ enum Entry {
             Task { @MainActor in await TTSBench.run(root: URL(fileURLWithPath: args[i + 1]), out: URL(fileURLWithPath: args[i + 2])); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--speakfile") {      // --speakfile en|zh lines.txt outdir: one wav per line
+            Task { @MainActor in
+                let zh = args[i + 1] == "zh"
+                let spec = VoicePack.spec(for: zh ? "neural:matcha" : "neural:supertonic:5")!
+                let lines = ((try? String(contentsOfFile: args[i + 2], encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+                for (k, line) in lines.enumerated() {
+                    guard let out = await VoiceEngine.shared.synthesize(line, spec) else { continue }
+                    TTSBench.save(out.samples, rate: out.rate, to: URL(fileURLWithPath: args[i + 3]).appending(path: String(format: "%02d.wav", k)))
+                }
+                print("wrote", lines.count)
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
+        if let i = args.firstIndex(of: "--fixterms") {        // --fixterms en|zh "text"
+            let zh = args[i + 1] == "zh"
+            let g = Glossary(text: TermPacks.cProgramming)
+            print(TermFixer.fix(args[i + 2], terms: g.vocabulary(for: zh ? .zhToEn : .enToZh), chinese: zh))
+            exit(0)
+        }
         if let i = args.firstIndex(of: "--systemtest") {     // --systemtest all|<bundle id> en|zh seconds [--engine e]
             let source = args[i + 1] == "all" ? ListenSource.allApps : .app(args[i + 1])
             let d: Direction = args[i + 2] == "zh" ? .zhToEn : .enToZh
