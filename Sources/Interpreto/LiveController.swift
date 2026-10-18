@@ -58,11 +58,16 @@ final class LiveController {
             if session.items.isEmpty { session = Session(direction: direction); started = Date() }
             else if session.direction != direction { newSession(); started = Date() }
             let device = AudioDevices.id(forUID: defaults.string(forKey: Pref.micUID), input: true)
+            // Voice on the normal speakers: play it through the microphone's engine so Apple's
+            // echo cancellation removes it from what the mic hears, and the speaker can keep
+            // talking. With headphones or a virtual cable chosen, there's no echo to cancel.
+            let echo = defaults.bool(forKey: Pref.speak) && (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty
+            speaker.use(engine: echo ? mic.engine : nil)
             mic.onLevel = { [weak self] v in DispatchQueue.main.async { self?.level = v } }
             do {
                 try await recognizer.start(
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
-                    input: { [mic] format in try mic.start(device: device, format: format) },
+                    input: { [mic] format in try mic.start(device: device, format: format, echoCancellation: echo) },
                     onPartial: { [weak self] in self?.partialChanged($0) },
                     onCommit: { [weak self] id, text, start, end in self?.committed(id, text, start, end) },
                     onRevise: { [weak self] id, text in self?.revised(id, text) },
@@ -81,7 +86,7 @@ final class LiveController {
         guard isListening else { return }
         isListening = false
         level = 0
-        mic.stop()
+        stopMic()
         Task { await recognizer.stop() }
     }
 
@@ -92,7 +97,7 @@ final class LiveController {
         let wasListening = isListening
         if wasListening {
             isListening = false
-            mic.stop()
+            stopMic()
             Task {
                 await recognizer.cancel()
                 partial = ""; draft = ""
@@ -104,6 +109,17 @@ final class LiveController {
         }
     }
 
+    /// Stops the microphone; if a translation is still being spoken through its engine, lets it
+    /// finish first.
+    private func stopMic() {
+        guard speaker.isSpeaking else { mic.stop(); return }
+        mic.stop(keepEngine: true)
+        Task {
+            while speaker.isSpeaking { try? await Task.sleep(for: .milliseconds(200)) }
+            if !isListening { mic.stopEngine() }
+        }
+    }
+
     func newSession() {
         if isListening { stop() }
         speaker.stop()
@@ -112,7 +128,18 @@ final class LiveController {
         started = Date()
     }
 
-    func speakingChanged(_ on: Bool) { if !on { speaker.stop() } }
+    /// The voice was turned on or off: switch echo cancellation to match (a quick restart of the
+    /// microphone; the session continues).
+    func speakingChanged(_ on: Bool) {
+        if !on { speaker.stop() }
+        guard isListening else { return }
+        isListening = false
+        mic.stop()
+        Task {
+            await recognizer.stop()
+            start()
+        }
+    }
 
     // MARK: recognition events
 

@@ -7,7 +7,8 @@ final class Speaker {
     static let maxBacklog = 6.0          // seconds of unplayed voice before a sentence is skipped
 
     private let synth = AVSpeechSynthesizer()
-    private let engine = AVAudioEngine()
+    private let ownEngine = AVAudioEngine()
+    private var engine: AVAudioEngine            // ownEngine, or the microphone's (echo cancellation)
     private let player = AVAudioPlayerNode()
     /// The player runs in the voice's own format; the engine's mixer converts it to the device
     /// smoothly. (Converting each small buffer separately leaves a click at every seam.)
@@ -16,6 +17,23 @@ final class Speaker {
     private var backlog = 0.0
 
     init() {
+        engine = ownEngine
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+    }
+
+    /// True while a translation is still being spoken.
+    var isSpeaking: Bool { backlog > 0.05 }
+
+    /// Play through `shared` (the microphone's echo-cancelling engine) or, with nil, through
+    /// Interpreto's own engine on the chosen output device.
+    func use(engine shared: AVAudioEngine?) {
+        let target = shared ?? ownEngine
+        guard target !== engine else { return }
+        player.stop()
+        backlog = 0
+        engine.detach(player)
+        engine = target
         engine.attach(player)
         engine.connect(player, to: engine.mainMixerNode, format: format)
     }
@@ -75,6 +93,7 @@ final class Speaker {
     }
 
     private func setOutput(_ uid: String?) {
+        guard engine === ownEngine else { return }   // the shared engine plays on the default output
         let uid = (uid?.isEmpty ?? true) ? nil : uid
         guard uid != deviceUID || !engine.isRunning else { return }
         if engine.isRunning { engine.stop() }
@@ -91,6 +110,7 @@ final class Speaker {
             engine.connect(player, to: engine.mainMixerNode, format: f)
         }
         if !engine.isRunning {
+            if engine !== ownEngine { use(engine: nil) }   // listening stopped: back to our own engine
             engine.prepare()
             do { try engine.start() } catch { return }
         }

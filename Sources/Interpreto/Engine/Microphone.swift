@@ -2,15 +2,29 @@ import AVFoundation
 import Speech
 
 /// Captures a microphone and streams it, converted to the speech model's format, as analyzer input.
+///
+/// With echo cancellation on, the spoken translation plays through this same engine, and Apple's
+/// voice processing (as in FaceTime) removes it from what the microphone hears. So the speaker can
+/// keep talking while the translation is spoken, without it being heard as speech.
 final class Microphone {
-    private let engine = AVAudioEngine()
+    let engine = AVAudioEngine()
     private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var tapped = false
 
     /// Called on the audio thread with the input level (RMS, 0…1).
     var onLevel: ((Float) -> Void)?
 
-    func start(device: AudioDeviceID?, format target: AVAudioFormat) throws -> AsyncStream<AnalyzerInput> {
+    func start(device: AudioDeviceID?, format target: AVAudioFormat, echoCancellation: Bool) throws -> AsyncStream<AnalyzerInput> {
         let input = engine.inputNode
+        if input.isVoiceProcessingEnabled != echoCancellation {
+            if engine.isRunning { engine.stop() }
+            try input.setVoiceProcessingEnabled(echoCancellation)
+        }
+        if echoCancellation {
+            // Don't turn down other apps (a video being translated, a call) while listening.
+            input.voiceProcessingOtherAudioDuckingConfiguration = .init(enableAdvancedDucking: false, duckingLevel: .min)
+            input.isVoiceProcessingAGCEnabled = true
+        }
         AudioDevices.route(input, to: device)
         let source = input.outputFormat(forBus: 0)
         guard source.sampleRate > 0, let converter = AVAudioConverter(from: source, to: target) else {
@@ -39,15 +53,25 @@ final class Microphone {
             }
             if error == nil, out.frameLength > 0 { cont.yield(AnalyzerInput(buffer: out)) }
         }
-        engine.prepare()
-        try engine.start()
+        tapped = true
+        if !engine.isRunning {
+            engine.prepare()
+            try engine.start()
+        }
         return stream
     }
 
-    func stop() {
-        engine.inputNode.removeTap(onBus: 0)
-        engine.stop()
+    /// Stops listening. With `keepEngine`, the engine keeps running so a translation still being
+    /// spoken through it can finish; call `stopEngine()` afterwards.
+    func stop(keepEngine: Bool = false) {
+        if tapped { engine.inputNode.removeTap(onBus: 0); tapped = false }
         continuation?.finish()
         continuation = nil
+        if !keepEngine { stopEngine() }
+    }
+
+    func stopEngine() {
+        guard !tapped else { return }
+        engine.stop()
     }
 }
