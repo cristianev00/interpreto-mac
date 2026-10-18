@@ -1,3 +1,4 @@
+import CryptoKit
 import FluidAudio
 import Foundation
 import Observation
@@ -45,6 +46,73 @@ final class ModelStore {
     private(set) var states: [SpeechEngine: State] = [:]
     /// The optional English → Chinese translation model (HY-MT2).
     private(set) var hymt2: State = .notInstalled
+    private(set) var voiceStates: [VoicePack: State] = [:]
+
+    func state(_ p: VoicePack) -> State {
+        if case .downloading = voiceStates[p] ?? .notInstalled { return voiceStates[p]! }
+        if case .failed = voiceStates[p] ?? .notInstalled { return voiceStates[p]! }
+        return p.isInstalled ? .installed : .notInstalled
+    }
+
+    /// Downloads a voice pack from sherpa-onnx's releases, checks it, and unpacks it.
+    func download(_ p: VoicePack) {
+        if case .downloading = state(p) { return }
+        voiceStates[p] = .downloading(0)
+        Task {
+            do {
+                let dir = VoicePack.folderURL
+                try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                for (i, (file, sha)) in p.files.enumerated() {
+                    let share = 1.0 / Double(p.files.count)
+                    let tmp = try await Self.fetch(VoicePack.url(file)) { f in
+                        Task { @MainActor in ModelStore.shared.voiceStates[p] = .downloading((Double(i) + f) * share) }
+                    }
+                    guard try await Self.sha256(tmp) == sha else {
+                        throw NSError(domain: "Interpreto", code: 20, userInfo: [NSLocalizedDescriptionKey: "The download was damaged."])
+                    }
+                    if file.hasSuffix(".tar.bz2") {
+                        try await Self.untar(tmp, into: dir)
+                        try? FileManager.default.removeItem(at: tmp)
+                    } else {
+                        try? FileManager.default.removeItem(at: dir.appending(path: file))
+                        try FileManager.default.moveItem(at: tmp, to: dir.appending(path: file))
+                    }
+                }
+                voiceStates[p] = p.isInstalled ? .installed : .failed("The voice didn’t install.")
+            } catch {
+                voiceStates[p] = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func remove(_ p: VoicePack) {
+        Task { await VoiceEngine.shared.unload() }
+        try? FileManager.default.trashItem(at: VoicePack.folderURL.appending(path: p.folder), resultingItemURL: nil)
+        voiceStates[p] = nil
+    }
+
+    private static func sha256(_ url: URL) async throws -> String {
+        try await Task.detached {
+            let h = try FileHandle(forReadingFrom: url)
+            defer { try? h.close() }
+            var hasher = SHA256()
+            while let chunk = try h.read(upToCount: 1 << 22), !chunk.isEmpty { hasher.update(data: chunk) }
+            return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        }.value
+    }
+
+    private static func untar(_ archive: URL, into dir: URL) async throws {
+        try await Task.detached {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
+            p.arguments = ["-xjf", archive.path, "-C", dir.path]
+            try p.run()
+            p.waitUntilExit()
+            if p.terminationStatus != 0 {
+                throw NSError(domain: "Interpreto", code: 21, userInfo: [NSLocalizedDescriptionKey: "The voice couldn’t be unpacked."])
+            }
+        }.value
+    }
 
     nonisolated static let folder = URL.applicationSupportDirectory.appending(path: "Interpreto/Models", directoryHint: .isDirectory)
     nonisolated static var parakeetFolder: URL { folder.appending(path: "parakeet", directoryHint: .isDirectory) }

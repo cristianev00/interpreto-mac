@@ -22,6 +22,56 @@ enum Entry {
             Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--ttsbench") {       // --ttsbench <models root> <out dir with zh.txt, en.txt>
+            Task { @MainActor in await TTSBench.run(root: URL(fileURLWithPath: args[i + 1]), out: URL(fileURLWithPath: args[i + 2])); exit(0) }
+            RunLoop.main.run()
+        }
+        if let i = args.firstIndex(of: "--voicepack"), let pack = VoicePack(rawValue: args[i + 1]) {
+            Task { @MainActor in
+                ModelStore.shared.download(pack)
+                while true {
+                    switch ModelStore.shared.state(pack) {
+                    case .installed: print("installed", pack.rawValue); exit(0)
+                    case .failed(let m): print("failed:", m); exit(1)
+                    default: try? await Task.sleep(for: .milliseconds(500))
+                    }
+                }
+            }
+            RunLoop.main.run()
+        }
+        if args.contains("--voicefirst") {                  // time to the first spoken clause, and memory
+            Task { @MainActor in
+                func rss() -> Double {
+                    var info = mach_task_basic_info(); var n = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / 4)
+                    _ = withUnsafeMutablePointer(to: &info) { $0.withMemoryRebound(to: integer_t.self, capacity: Int(n)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &n) } }
+                    return Double(info.resident_size) / 1e6
+                }
+                print(String(format: "memory at start: %.0f MB", rss()))
+                let tests: [(String, String)] = [
+                    ("neural:matcha", "在目睹了第一次世界大战期间的恐怖与暴行之后，各国都希望在未来避免再发生类似的情况。"),
+                    ("neural:supertonic:0", "After seeing the horrors and atrocities of war during World War One, nations desired to avoid such a situation again in the future."),
+                ]
+                for (id, text) in tests {
+                    guard let spec = VoicePack.spec(for: id) else { continue }
+                    _ = await VoiceEngine.shared.synthesize("你好。", spec)          // load
+                    let clauses = Speaker.clauses(text)
+                    let t = Date()
+                    let first = await VoiceEngine.shared.synthesize(clauses[0], spec)
+                    let firstTime = Date().timeIntervalSince(t)
+                    let whole = Date()
+                    _ = await VoiceEngine.shared.synthesize(text, spec)
+                    print(String(format: "%@: %d clauses; first clause ready in %.2fs (%.1fs of audio); whole sentence at once %.2fs",
+                                 id, clauses.count, firstTime, Double(first?.samples.count ?? 0) / Double(first?.rate ?? 1), Date().timeIntervalSince(whole)))
+                }
+                try? await HYMT2.shared.load()
+                print(String(format: "memory with voices + HY-MT2 loaded: %.0f MB", rss()))
+                await HYMT2.shared.unload(); await VoiceEngine.shared.unload()
+                try? await Task.sleep(for: .seconds(1))
+                print(String(format: "memory after unloading: %.0f MB", rss()))
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         if let i = args.firstIndex(of: "--hymt") {           // --hymt en|zh lines.txt out.json
             Task {
                 let d: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
@@ -309,5 +359,89 @@ enum EchoTest {
         mic.stop()
         await recognizer.stop()
         print("Interpreto spoke \(k) Chinese sentences")
+    }
+}
+
+
+/// Times each candidate voice and saves its audio, for intelligibility scoring and listening.
+@MainActor
+enum TTSBench {
+    static let candidates: [NeuralVoiceSpec] = [
+        .init(id: "matcha-zh", kind: .matcha, folder: "matcha-icefall-zh-en", sid: 0, language: "zh", name: "Matcha"),
+        .init(id: "kokoro11-zh-3", kind: .kokoro, folder: "kokoro-int8-multi-lang-v1_1", sid: 3, language: "zh", name: "Kokoro 1.1 #3"),
+        .init(id: "kokoro11-zh-50", kind: .kokoro, folder: "kokoro-int8-multi-lang-v1_1", sid: 50, language: "zh", name: "Kokoro 1.1 #50"),
+        .init(id: "kokoro10-zh-45", kind: .kokoro, folder: "kokoro-int8-multi-lang-v1_0", sid: 45, language: "zh", name: "Kokoro 1.0 xiaobei"),
+        .init(id: "melo-zh", kind: .melo, folder: "vits-melo-tts-zh_en", sid: 0, language: "zh", name: "MeloTTS"),
+        .init(id: "supertonic-en-0", kind: .supertonic, folder: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11", sid: 0, language: "en", name: "Supertonic 3 #0"),
+        .init(id: "supertonic-en-5", kind: .supertonic, folder: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11", sid: 5, language: "en", name: "Supertonic 3 #5"),
+        .init(id: "kokoro10-en-heart", kind: .kokoro, folder: "kokoro-int8-multi-lang-v1_0", sid: 3, language: "en", name: "Kokoro af_heart"),
+        .init(id: "piper-en-lessac", kind: .piper, folder: "vits-piper-en_US-lessac-high-int8", sid: 0, language: "en", name: "Piper lessac"),
+        .init(id: "kitten-en-0", kind: .kitten, folder: "kitten-mini-en-v0_8", sid: 0, language: "en", name: "Kitten mini"),
+    ]
+
+    static func run(root: URL, out: URL) async {
+        var summary: [[String: Any]] = []
+        for lang in ["zh", "en"] {
+            let lines = ((try? String(contentsOf: out.appending(path: "\(lang).txt"), encoding: .utf8)) ?? "")
+                .split(separator: "\n").map(String.init)
+            if lines.isEmpty { continue }
+            // Apple baseline
+            summary.append(await apple(lang, lines, out))
+            let only = ProcessInfo.processInfo.environment["TTS_ONLY"]
+            let list = ProcessInfo.processInfo.environment["TTS_SUPERTONIC_ALL"] == nil ? candidates
+                : (0..<10).map { NeuralVoiceSpec(id: "supertonic-en-voice\($0 + 1)", kind: .supertonic,
+                                                 folder: "sherpa-onnx-supertonic-3-tts-int8-2026-05-11", sid: $0, language: "en", name: "") }
+            for spec in list where spec.language == lang && (only == nil || spec.id.contains(only!)) {
+                let t0 = Date()
+                guard let voice = NeuralVoice(spec, root: root) else { print("could not load", spec.id); continue }
+                let load = Date().timeIntervalSince(t0)
+                var times: [Double] = [], durs: [Double] = []
+                for (k, line) in lines.enumerated() {
+                    let t = Date()
+                    let audio = voice.synthesize(line)
+                    times.append(Date().timeIntervalSince(t))
+                    durs.append(Double(audio.count) / Double(voice.sampleRate))
+                    save(audio, rate: voice.sampleRate, to: out.appending(path: "\(spec.id)_\(k).wav"))
+                }
+                let rtf = times.reduce(0, +) / max(0.001, durs.reduce(0, +))
+                print(String(format: "%-20@ load %.2fs  median synth %.2fs  RTF %.3f", spec.id as NSString, load, times.sorted()[times.count / 2], rtf))
+                summary.append(["id": spec.id, "lang": lang, "load": load, "times": times, "durations": durs])
+            }
+        }
+        try? JSONSerialization.data(withJSONObject: summary).write(to: out.appending(path: "summary.json"))
+    }
+
+    static func apple(_ lang: String, _ lines: [String], _ out: URL) async -> [String: Any] {
+        let voice = Speaker.voices(for: lang == "zh" ? "zh-CN" : "en-US").first
+        let synth = AVSpeechSynthesizer()
+        var times: [Double] = [], durs: [Double] = []
+        for (k, line) in lines.enumerated() {
+            let u = AVSpeechUtterance(string: line); u.voice = voice
+            var samples: [Float] = []; var rate = 22050
+            let t = Date()
+            await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+                synth.write(u) { buf in
+                    guard let pcm = buf as? AVAudioPCMBuffer else { return }
+                    if pcm.frameLength == 0 { done.resume(); return }
+                    rate = Int(pcm.format.sampleRate)
+                    if let c = pcm.floatChannelData?[0] { samples += UnsafeBufferPointer(start: c, count: Int(pcm.frameLength)) }
+                }
+            }
+            times.append(Date().timeIntervalSince(t)); durs.append(Double(samples.count) / Double(rate))
+            save(samples, rate: rate, to: out.appending(path: "apple-\(lang)_\(k).wav"))
+        }
+        print(String(format: "%-20@ median synth %.2fs", "apple-\(lang)" as NSString, times.sorted()[times.count / 2]))
+        return ["id": "apple-\(lang)", "lang": lang, "load": 0, "times": times, "durations": durs]
+    }
+
+    static func save(_ samples: [Float], rate: Int, to url: URL) {
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: Double(rate), channels: 1),
+              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(max(1, samples.count))),
+              let file = try? AVAudioFile(forWriting: url, settings: [AVFormatIDKey: kAudioFormatLinearPCM, AVSampleRateKey: rate,
+                                                                      AVNumberOfChannelsKey: 1, AVLinearPCMBitDepthKey: 16])
+        else { return }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
+        try? file.write(from: buf)
     }
 }

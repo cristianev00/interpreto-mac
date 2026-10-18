@@ -72,6 +72,11 @@ final class Speaker {
     func speak(_ text: String, language: String, voiceID: String?, outputUID: String?, onStart: @escaping () -> Void) -> Bool {
         guard backlog < Self.maxBacklog else { return false }
         setOutput(outputUID)
+        let chosen = (voiceID?.isEmpty ?? true) ? Self.automaticVoice(language) : voiceID
+        if let spec = VoicePack.spec(for: chosen), VoicePack.pack(of: spec).isInstalled {
+            speakNeural(text, spec, onStart: onStart)
+            return true
+        }
         let u = AVSpeechUtterance(string: text)
         u.voice = voiceID.flatMap(AVSpeechSynthesisVoice.init(identifier:)) ?? Self.voices(for: language).first
         u.rate = AVSpeechUtteranceDefaultSpeechRate * 1.08
@@ -88,9 +93,73 @@ final class Speaker {
     }
 
     func stop() {
+        generation += 1
+        neuralChain?.cancel()
+        neuralChain = nil
         synth.stopSpeaking(at: .immediate)
         player.stop()
         backlog = 0
+    }
+
+    // MARK: natural (neural) voices
+
+    private var neuralChain: Task<Void, Never>?
+    private var generation = 0
+
+    /// "Automatic": the natural voice when it's downloaded, otherwise Apple's best.
+    static func automaticVoice(_ language: String) -> String? {
+        if language.hasPrefix("zh") { return VoicePack.matcha.isInstalled ? "neural:matcha" : nil }
+        return VoicePack.supertonic.isInstalled ? "neural:supertonic:0" : nil
+    }
+
+    /// Synthesizes clause by clause, in order, so the first words play as soon as they're ready.
+    private func speakNeural(_ text: String, _ spec: NeuralVoiceSpec, onStart: @escaping () -> Void) {
+        let gen = generation
+        let previous = neuralChain
+        neuralChain = Task { @MainActor [weak self] in
+            await previous?.value
+            var started = false
+            for clause in Self.clauses(text) {
+                guard let self, gen == self.generation else { return }
+                guard let out = await VoiceEngine.shared.synthesize(clause, spec) else { continue }
+                guard gen == self.generation, let pcm = Self.buffer(out.samples, rate: out.rate) else { return }
+                if !started { started = true; onStart() }
+                self.enqueue(pcm)
+            }
+        }
+    }
+
+    /// Splits at clause punctuation, joining very short pieces so the speech isn't choppy.
+    static func clauses(_ text: String) -> [String] {
+        var pieces: [String] = [], current = ""
+        for ch in text {
+            current.append(ch)
+            if "，。！？；：,.!?;:".contains(ch) {
+                let t = current.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { pieces.append(t) }
+                current = ""
+            }
+        }
+        let rest = current.trimmingCharacters(in: .whitespaces)
+        if !rest.isEmpty { pieces.append(rest) }
+        var out: [String] = [], pending = ""
+        for p in pieces {
+            pending = pending.isEmpty ? p : pending + (p.first?.isASCII == true ? " " : "") + p
+            if pending.filter({ $0.isLetter || $0.isNumber }).count >= 8 { out.append(pending); pending = "" }
+        }
+        if !pending.isEmpty {
+            if let last = out.popLast() { out.append(last + (pending.first?.isASCII == true ? " " : "") + pending) }
+            else { out.append(pending) }
+        }
+        return out
+    }
+
+    private static func buffer(_ samples: [Float], rate: Int) -> AVAudioPCMBuffer? {
+        guard let fmt = AVAudioFormat(standardFormatWithSampleRate: Double(rate), channels: 1),
+              let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(samples.count)) else { return nil }
+        buf.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer { buf.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count) }
+        return buf
     }
 
     private func setOutput(_ uid: String?) {

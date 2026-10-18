@@ -22,6 +22,27 @@ private struct AudioSettings: View {
     @AppStorage(Pref.outputUID) private var outputUID = ""
     @State private var inputs: [AudioDevice] = []
     @State private var outputs: [AudioDevice] = []
+    private var store: ModelStore { .shared }
+
+    @ViewBuilder
+    private func packRow(_ pack: VoicePack) -> some View {
+        LabeledContent(pack.title) {
+            switch store.state(pack) {
+            case .installed:
+                HStack {
+                    Label("Downloaded", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Button("Remove") { store.remove(pack) }.buttonStyle(.borderless)
+                }
+            case .downloading(let p): ProgressView(value: p).frame(width: 140)
+            case .notInstalled: Button("Download (\(pack.size))") { store.download(pack) }
+            case .failed(let message):
+                HStack {
+                    Text(message).foregroundStyle(.red).lineLimit(1)
+                    Button("Try Again") { store.download(pack) }
+                }
+            }
+        }
+    }
 
     var body: some View {
         Form {
@@ -36,12 +57,23 @@ private struct AudioSettings: View {
                 Group {
                     Picker("Chinese voice", selection: $voiceZH) {
                         Text("Automatic").tag("")
-                        ForEach(Speaker.voices(for: "zh-CN"), id: \.identifier) { Text(Speaker.label($0)).tag($0.identifier) }
+                        Section("Natural") { Text("Matcha").tag("neural:matcha") }
+                        Section("Apple") {
+                            ForEach(Speaker.voices(for: "zh-CN"), id: \.identifier) { Text(Speaker.label($0)).tag($0.identifier) }
+                        }
                     }
+                    .onChange(of: voiceZH) { _, v in if v.hasPrefix("neural:"), !VoicePack.matcha.isInstalled { store.download(.matcha) } }
                     Picker("English voice", selection: $voiceEN) {
                         Text("Automatic").tag("")
-                        ForEach(Speaker.voices(for: "en-US"), id: \.identifier) { Text(Speaker.label($0)).tag($0.identifier) }
+                        Section("Natural") {
+                            ForEach(0..<10, id: \.self) { Text(VoicePack.supertonicName($0)).tag("neural:supertonic:\($0)") }
+                        }
+                        Section("Apple") {
+                            ForEach(Speaker.voices(for: "en-US"), id: \.identifier) { Text(Speaker.label($0)).tag($0.identifier) }
+                        }
                     }
+                    .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.supertonic.isInstalled { store.download(.supertonic) } }
+                    ForEach(VoicePack.allCases) { pack in packRow(pack) }
                     Picker("Play on", selection: $outputUID) {
                         Text("System Default").tag("")
                         ForEach(outputs) { Text($0.name).tag($0.uid) }
@@ -52,11 +84,8 @@ private struct AudioSettings: View {
                 Text("Spoken Translation")
             } footer: {
                 VStack(alignment: .leading, spacing: 8) {
+                    Text("Natural voices run on this Mac and sound much more human than Apple’s standard voices. “Automatic” uses them once downloaded.")
                     Text("Use headphones so the microphone doesn’t hear the voice. To send it into Zoom or Teams, choose a virtual cable such as BlackHole.")
-                    HStack(alignment: .firstTextBaseline) {
-                        Text("For a much more natural voice, download a free Premium or Enhanced voice (for Chinese: Lili or Tingting; for English: Ava, Zoe or Evan). Interpreto picks it up automatically.")
-                        Button("Get Voices…") { openVoiceSettings() }
-                    }
                 }
                 .font(.caption).foregroundStyle(.secondary)
             }

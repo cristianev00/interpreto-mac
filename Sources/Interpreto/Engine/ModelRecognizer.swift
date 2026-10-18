@@ -85,6 +85,9 @@ final class ModelRecognizer: SpeechRecognizing {
         }
     }
 
+    /// Frees the model's memory; it reloads on the next start.
+    func unload() { model = nil }
+
     func stop() async {
         feedTask?.cancel()
         feedTask = nil

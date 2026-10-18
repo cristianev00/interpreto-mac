@@ -41,6 +41,26 @@ final class LiveController {
         return r
     }
 
+    /// Three minutes after listening stops (and nothing is being spoken), free the optional
+    /// models' memory (speech models, HY-MT2, natural voices: up to ~3 GB). They reload in about
+    /// a second when listening starts again.
+    private var idleTask: Task<Void, Never>?
+    static let idleSeconds = 180.0
+
+    private func scheduleIdleUnload() {
+        idleTask?.cancel()
+        idleTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(Self.idleSeconds))
+            guard let self, !Task.isCancelled else { return }
+            while self.speaker.isSpeaking { try? await Task.sleep(for: .seconds(5)) }
+            guard !self.isListening, !Task.isCancelled else { return }
+            for r in self.modelRecognizers.values { r.unload() }
+            await HYMT2.shared.unload()
+            await VoiceEngine.shared.unload()
+            Diagnostics.event("idle: optional models unloaded")
+        }
+    }
+
     /// Name of the speech engine for the current direction (what the sidebar shows).
     var engineName: String {
         let e = SpeechEngine.chosen(for: direction)
@@ -77,6 +97,7 @@ final class LiveController {
 
     func start() {
         guard !isListening, !isStarting else { return }
+        idleTask?.cancel()
         isStarting = true
         Task {
             defer { isStarting = false }
@@ -128,6 +149,7 @@ final class LiveController {
         guard isListening else { return }
         isListening = false
         level = 0
+        scheduleIdleUnload()
         stopMic()
         Task { await recognizer.stop() }
     }
