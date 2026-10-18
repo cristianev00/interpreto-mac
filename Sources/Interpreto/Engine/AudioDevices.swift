@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreAudio
+import Observation
 
 /// A microphone or speaker, identified by its stable Core Audio UID (saved in settings).
 struct AudioDevice: Identifiable, Hashable {
@@ -36,6 +37,15 @@ enum AudioDevices {
         guard var dev = device, let unit = node.audioUnit else { return }
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0,
                              &dev, UInt32(MemoryLayout<AudioDeviceID>.size))
+    }
+
+    /// The device an AVAudioEngine node is actually using right now.
+    static func current(_ node: AVAudioIONode) -> AudioDeviceID? {
+        guard let unit = node.audioUnit else { return nil }
+        var dev = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &dev, &size)
+        return status == noErr && dev != 0 ? dev : nil
     }
 
     private static func channels(_ id: AudioDeviceID, input: Bool) -> Int {
@@ -99,13 +109,16 @@ enum AudioDevices {
         }
     }
 
-    /// True for microphones worn close to the mouth (AirPods, Bluetooth or USB headsets).
+    /// True for microphones that don't hear the room's loudspeakers: worn close to the mouth
+    /// (AirPods, Bluetooth headsets) or virtual.
     static func isHeadset(_ uid: String?) -> Bool {
         guard let uid else { return false }
         let n = name(uid, input: true)
         if ["airpods", "headset", "headphone", "earphone", "buds"].contains(where: n.contains) { return true }
         let t = transport(uid, input: true)
-        return t == kAudioDeviceTransportTypeBluetooth || t == kAudioDeviceTransportTypeBluetoothLE
+        // Virtual inputs (Teams, BlackHole…) can't hear the room either.
+        return [kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE,
+                kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate].contains(t)
     }
 }
 
@@ -122,4 +135,100 @@ final class PlaybackState: @unchecked Sendable {
     }
     func stopped() { lock.withLock { playingUntil = Date().addingTimeInterval(0.35) } }
     var isActive: Bool { lock.withLock { Date() < playingUntil } }
+}
+
+// MARK: what the menus show
+
+/// What a device is, for its icon and description.
+enum DeviceKind {
+    case builtIn, headphones, bluetooth, usb, display, iPhone, virtual, other
+
+    var icon: String {
+        switch self {
+        case .builtIn: "laptopcomputer"
+        case .headphones: "airpods"
+        case .bluetooth: "headphones"
+        case .usb: "cable.connector"
+        case .display: "display"
+        case .iPhone: "iphone"
+        case .virtual: "point.3.connected.trianglepath.dotted"
+        case .other: "speaker.wave.2"
+        }
+    }
+}
+
+extension AudioDevices {
+    static func kind(_ device: AudioDevice) -> DeviceKind {
+        let n = device.name.lowercased()
+        var addr = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType,
+                                              mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+        var t = UInt32(0)
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        _ = AudioObjectGetPropertyData(device.id, &addr, 0, nil, &size, &t)
+        if n.contains("iphone") || n.contains("ipad") || t == kAudioDeviceTransportTypeContinuityCaptureWired
+            || t == kAudioDeviceTransportTypeContinuityCaptureWireless { return .iPhone }
+        switch t {
+        case kAudioDeviceTransportTypeBuiltIn: return n.contains("headphone") ? .headphones : .builtIn
+        case kAudioDeviceTransportTypeBluetooth, kAudioDeviceTransportTypeBluetoothLE:
+            return n.contains("airpods") || n.contains("beats") ? .headphones : .bluetooth
+        case kAudioDeviceTransportTypeUSB: return .usb
+        case kAudioDeviceTransportTypeDisplayPort, kAudioDeviceTransportTypeHDMI: return .display
+        case kAudioDeviceTransportTypeVirtual, kAudioDeviceTransportTypeAggregate, kAudioDeviceTransportTypeAutoAggregate:
+            return .virtual
+        default: return .other
+        }
+    }
+}
+
+/// The Mac's microphones and speakers, kept up to date as devices are plugged in, connected
+/// or removed, and as the system default changes. Menus read it; listening reacts to it.
+@MainActor
+@Observable
+final class DeviceMonitor {
+    static let shared = DeviceMonitor()
+    private(set) var inputs: [AudioDevice] = []
+    private(set) var outputs: [AudioDevice] = []
+    private(set) var defaultInput: String?
+    private(set) var defaultOutput: String?
+    /// Called after every change (LiveController re-checks the devices it listens with).
+    var onChange: (() -> Void)?
+    private var pending: DispatchWorkItem?
+
+    private init() {
+        refresh()
+        for selector in [kAudioHardwarePropertyDevices, kAudioHardwarePropertyDefaultInputDevice,
+                         kAudioHardwarePropertyDefaultOutputDevice] {
+            var addr = AudioObjectPropertyAddress(mSelector: selector, mScope: kAudioObjectPropertyScopeGlobal,
+                                                  mElement: kAudioObjectPropertyElementMain)
+            AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, .main) { [weak self] _, _ in
+                MainActor.assumeIsolated { self?.changed() }
+            }
+        }
+    }
+
+    /// Devices often appear in several steps (AirPods connect input and output separately).
+    private func changed() {
+        pending?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            MainActor.assumeIsolated {
+                self?.refresh()
+                self?.onChange?()
+            }
+        }
+        pending = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    func refresh() {
+        // Interpreto's own private devices never show up.
+        let mine: (AudioDevice) -> Bool = { $0.name.hasPrefix("Interpreto") || $0.name.hasPrefix("CADefaultDeviceAggregate") }
+        inputs = AudioDevices.list(input: true).filter { !mine($0) }
+        outputs = AudioDevices.list(input: false).filter { !mine($0) }
+        defaultInput = AudioDevices.defaultUID(input: true)
+        defaultOutput = AudioDevices.defaultUID(input: false)
+    }
+
+    func name(_ uid: String?, input: Bool) -> String? {
+        (input ? inputs : outputs).first { $0.uid == uid }?.name
+    }
 }

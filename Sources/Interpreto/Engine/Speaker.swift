@@ -1,3 +1,4 @@
+import os
 import AVFoundation
 
 /// Speaks translations with Apple's voices on any output device (headphones, a speaker, or a
@@ -42,6 +43,15 @@ final class Speaker {
     /// Voices for a language, best first: Apple's neural (Siri-quality) voices, then premium and
     /// enhanced ones, then the standard ones. Novelty and character voices are left out.
     static func voices(for language: String) -> [AVSpeechSynthesisVoice] {
+        // Menus ask on every redraw; the installed voices rarely change.
+        if let cached = voiceCache.withLock({ $0[language] }) { return cached }
+        let list = findVoices(for: language)
+        voiceCache.withLock { $0[language] = list }
+        return list
+    }
+    private static let voiceCache = OSAllocatedUnfairLock(initialState: [String: [AVSpeechSynthesisVoice]]())
+
+    private static func findVoices(for language: String) -> [AVSpeechSynthesisVoice] {
         let prefix = String(language.prefix(2))
         return AVSpeechSynthesisVoice.speechVoices()
             .filter { v in
@@ -165,11 +175,17 @@ final class Speaker {
 
     private func setOutput(_ uid: String?) {
         guard engine === ownEngine else { return }   // the shared engine plays on the default output
-        let uid = (uid?.isEmpty ?? true) ? nil : uid
-        guard uid != deviceUID || !engine.isRunning else { return }
+        // The chosen output if it's connected, otherwise the Mac's current default.
+        let device = AudioDevices.id(forUID: uid, input: false).map { _ in uid }
+            ?? AudioDevices.defaultUID(input: false)
+        // Compare with the device the engine really uses: macOS moves it back to the default
+        // output when echo cancellation starts on the microphone.
+        let id = AudioDevices.id(forUID: device, input: false)
+        guard id != AudioDevices.current(engine.outputNode) || !engine.isRunning else { return }
         if engine.isRunning { engine.stop() }
-        deviceUID = uid
-        AudioDevices.route(engine.outputNode, to: AudioDevices.id(forUID: uid, input: false))
+        deviceUID = device
+        AudioDevices.route(engine.outputNode, to: id)
+        Diagnostics.event("voice: plays on \(device ?? "-")")
     }
 
     private func enqueue(_ pcm: AVAudioPCMBuffer) {

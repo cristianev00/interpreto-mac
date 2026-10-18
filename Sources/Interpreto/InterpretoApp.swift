@@ -29,6 +29,12 @@ struct InterpretoApp: App {
             }
             CommandGroup(after: .help) {
                 Button("Record Diagnostics (30 s)") { live.recordDiagnostics() }
+                Button("Test Audio Devices…") {
+                    Task {
+                        await ConfigTest.run(live)
+                        NSWorkspace.shared.open(ConfigTest.report)
+                    }
+                }
             }
             CommandMenu("Translate") {
                 Button(live.isListening ? "Stop Listening" : "Start Listening") { live.toggle() }
@@ -53,6 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Release the translation model from the GPU before quitting (llama.cpp requires it).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Diagnostics.event("app quitting (\(NSApp.windows.filter(\.isVisible).count) windows open)")
         Task {
             await HYMT2.shared.unload()
             await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
@@ -108,6 +115,11 @@ struct ContentView: View {
             await readiness.check()
             live.preloadEngine()
             if CommandLine.arguments.contains("--diagnose") { live.recordDiagnostics() }
+            if CommandLine.arguments.contains("--configtest") {
+                await ConfigTest.run(live)
+                await HYMT2.shared.unload()
+                exit(0)
+            }
         }
         .alert("Interpreto", isPresented: Binding(get: { live.message != nil }, set: { if !$0 { live.message = nil } })) {
             Button("OK") { live.message = nil }
@@ -138,6 +150,7 @@ struct StatusFooter: View {
     // Re-render when the engine choice changes in Settings.
     @AppStorage(Pref.engineEN) private var engineEN = ""
     @AppStorage(Pref.engineZH) private var engineZH = ""
+    @AppStorage(Pref.speak) private var speak = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -149,12 +162,17 @@ struct StatusFooter: View {
             Label("Speech: \(live.engineName)", systemImage: "waveform")
                 .foregroundStyle(.secondary)
                 .help("Change in Settings → Speech")
+            Label("\(live.inputName) → \(speak ? live.outputName : "voice off")", systemImage: "arrow.left.arrow.right")
+                .foregroundStyle(.secondary)
             if let d = live.lastDelay {
                 Label(String(format: "Translated in %.2f s", d), systemImage: "bolt.fill")
                     .foregroundStyle(.secondary)
             }
             Label("Runs entirely on this Mac", systemImage: "lock.fill")
                 .foregroundStyle(.tertiary)
+            SettingsButton(tab: .speech, title: "Settings…", icon: "gearshape")
+                .buttonStyle(.borderless)
+                .padding(.top, 6)
         }
         .font(.caption)
         .labelStyle(.titleAndIcon)

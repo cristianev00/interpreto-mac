@@ -15,6 +15,9 @@ final class Microphone {
     private var configObserver: NSObjectProtocol?
     /// Buffers received since the last start (to detect a microphone that delivers nothing).
     private(set) var buffersReceived = 0
+    /// Of those, buffers silenced because the spoken translation was playing.
+    private(set) var buffersMuted = 0
+    private let processLock = NSLock()
 
     /// When the translation plays on loudspeakers without echo cancellation, hand the recognizer
     /// silence while it plays, so the microphone can't pick up the voice and translate it again.
@@ -77,7 +80,7 @@ final class Microphone {
         AudioDevices.route(input, to: device)          // once; not on reconnects (it can trigger another one)
         let (stream, cont) = AudioStream.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
-        buffersReceived = 0
+        buffersReceived = 0; buffersMuted = 0
         guard Self.isValid(input.outputFormat(forBus: 0)) else {
             throw NSError(domain: "Interpreto", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "This microphone can’t be used. Choose another one in Settings."])
@@ -93,7 +96,7 @@ final class Microphone {
             } catch {
                 attempt += 1
                 Diagnostics.event("mic: start attempt \(attempt) failed: \(error)")
-                if attempt >= 3 {
+                if attempt >= 4 {
                     // The engine can't run this device combination: record without echo
                     // cancellation rather than not at all.
                     input.removeTap(onBus: 0); tapped = false
@@ -104,7 +107,7 @@ final class Microphone {
                 }
                 input.removeTap(onBus: 0); tapped = false
                 engine.reset()
-                Thread.sleep(forTimeInterval: 0.3)
+                Thread.sleep(forTimeInterval: 0.25 * Double(attempt))
                 installTap()
             }
         }
@@ -134,21 +137,26 @@ final class Microphone {
 
     /// First channel as mono, converted to the model's format (rebuilt when the rate changes).
     private func process(_ raw: AVAudioPCMBuffer, _ cont: AudioStream.Continuation) {
-        guard let target, let ch = raw.floatChannelData?[0], raw.frameLength > 0 else { return }
+        processLock.lock(); defer { processLock.unlock() }    // an old and a new device can overlap
+        guard let target, raw.frameLength > 0, raw.format.commonFormat == .pcmFormatFloat32,
+              let data = raw.audioBufferList.pointee.mBuffers.mData else { return }
+        let ch = data.assumingMemoryBound(to: Float.self)
         let rate = raw.format.sampleRate
-        if mono?.sampleRate != rate {
+        if mono?.sampleRate != rate || converter?.outputFormat != target {
             mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: rate, channels: 1, interleaved: false)
             converter = mono.flatMap { AVAudioConverter(from: $0, to: target) }
         }
         guard let mono, let converter,
               let buffer = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: raw.frameLength),
               let dst = buffer.floatChannelData?[0] else { return }
-        let n = Int(raw.frameLength)
-        buffersReceived += 1
-        buffer.frameLength = raw.frameLength
         let stride = raw.format.isInterleaved ? Int(raw.format.channelCount) : 1
+        let n = min(Int(raw.frameLength), Int(raw.audioBufferList.pointee.mBuffers.mDataByteSize) / 4 / stride)
+        guard n > 0 else { return }
+        buffersReceived += 1
+        buffer.frameLength = AVAudioFrameCount(n)
         if muteWhileSpeaking, !echoCancelled, PlaybackState.shared.isActive {
             dst.update(repeating: 0, count: n)            // the voice is playing: hear nothing
+            buffersMuted += 1
         } else if stride == 1 {
             dst.update(from: ch, count: n)
         } else {
@@ -196,7 +204,7 @@ final class Microphone {
         session.addOutput(output)
         let (stream, cont) = AudioStream.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
-        buffersReceived = 0
+        buffersReceived = 0; buffersMuted = 0
         let delegate = CaptureDelegate { [weak self] pcm in self?.process(pcm, cont) }
         output.setSampleBufferDelegate(delegate, queue: captureQueue)
         captureDelegate = delegate
@@ -213,7 +221,7 @@ final class Microphone {
     private func startSystem(_ source: ListenSource) throws -> AudioStream {
         let (stream, cont) = AudioStream.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
-        buffersReceived = 0
+        buffersReceived = 0; buffersMuted = 0
         let system = SystemAudio()
         try system.start(source) { [weak self] buffer in self?.process(buffer, cont) }
         self.system = system
@@ -268,6 +276,8 @@ final class Microphone {
         guard !tapped else { return }
         Diagnostics.event("mic: engine stopped")
         engine.stop()
+        // Release the echo canceller's device now: a new engine can't start it while this one holds it.
+        if engine.inputNode.isVoiceProcessingEnabled { try? engine.inputNode.setVoiceProcessingEnabled(false) }
     }
 }
 

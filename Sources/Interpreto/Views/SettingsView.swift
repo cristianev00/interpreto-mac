@@ -1,13 +1,19 @@
 import AVFoundation
 import SwiftUI
 
+enum SettingsTab: String {
+    case speech, audio, display, glossary
+}
+
 struct SettingsView: View {
+    @AppStorage("settingsTab") private var tab = SettingsTab.speech
+
     var body: some View {
-        TabView {
-            Tab("Speech", systemImage: "person.wave.2") { EngineSettings() }
-            Tab("Audio", systemImage: "waveform") { AudioSettings() }
-            Tab("Display", systemImage: "textformat.size") { DisplaySettings() }
-            Tab("Glossary", systemImage: "character.book.closed") { GlossarySettings() }
+        TabView(selection: $tab) {
+            Tab("Speech", systemImage: "person.wave.2", value: .speech) { EngineSettings() }
+            Tab("Audio", systemImage: "waveform", value: .audio) { AudioSettings() }
+            Tab("Display", systemImage: "textformat.size", value: .display) { DisplaySettings() }
+            Tab("Glossary", systemImage: "character.book.closed", value: .glossary) { GlossarySettings() }
         }
         .frame(width: 520)
         .scenePadding()
@@ -15,14 +21,12 @@ struct SettingsView: View {
 }
 
 private struct AudioSettings: View {
-    @AppStorage(Pref.micUID) private var micUID = ""
+    @Environment(LiveController.self) private var live
     @AppStorage(Pref.speak) private var speak = false
     @AppStorage(Pref.voiceZH) private var voiceZH = ""
     @AppStorage(Pref.voiceEN) private var voiceEN = ""
-    @AppStorage(Pref.outputUID) private var outputUID = ""
-    @State private var inputs: [AudioDevice] = []
-    @State private var outputs: [AudioDevice] = []
     private var store: ModelStore { .shared }
+    private var devices: DeviceMonitor { .shared }
 
     @ViewBuilder
     private func packRow(_ pack: VoicePack) -> some View {
@@ -47,14 +51,48 @@ private struct AudioSettings: View {
     var body: some View {
         Form {
             Section {
-                Picker("Microphone", selection: $micUID) {
-                    Text("System Default").tag("")
-                    ForEach(inputs) { Text($0.name).tag($0.uid) }
+                Picker("Listen to", selection: Binding(
+                    get: { live.source == .microphone ? "mic" : "mac" },
+                    set: { live.listen(to: $0 == "mic" ? .microphone : .allApps) })) {
+                    Label("Microphone", systemImage: "mic").tag("mic")
+                    Label("This Mac’s sound", systemImage: "macbook").tag("mac")
                 }
+                .pickerStyle(.segmented)
+                if live.source == .microphone {
+                    Picker("Microphone", selection: Binding(get: { live.micUID }, set: { live.listen(to: .microphone, mic: $0) })) {
+                        Label("Default (\(devices.name(devices.defaultInput, input: true) ?? "none"))", systemImage: "mic").tag("")
+                        ForEach(devices.inputs) { Label($0.name, systemImage: AudioDevices.kind($0).icon).tag($0.uid) }
+                        if let missing = live.missingMic {
+                            Label("\(missing) (not connected)", systemImage: "exclamationmark.circle").tag(live.micUID)
+                        }
+                    }
+                    LabeledContent("Level") {
+                        if live.isListening { LevelMeter(level: live.level) }
+                        else { Text("Shown while listening").foregroundStyle(.secondary) }
+                    }
+                } else {
+                    LabeledContent("Listening to", value: live.sourceName)
+                }
+            } header: {
+                Text("Input")
+            } footer: {
+                Text(live.missingMic != nil
+                     ? "\(live.missingMic!) isn’t connected, so the default microphone is used. Interpreto switches back as soon as it connects."
+                     : "Changes apply immediately, even while listening.")
+                    .font(.caption).foregroundStyle(.secondary)
             }
             Section {
                 Toggle("Speak the translation aloud", isOn: $speak)
+                    .onChange(of: speak) { _, on in live.speakingChanged(on) }
                 Group {
+                    Picker("Play on", selection: Binding(get: { live.outputUID }, set: { live.setOutput($0) })) {
+                        Label("Default (\(devices.name(devices.defaultOutput, input: false) ?? "none"))", systemImage: "speaker.wave.2").tag("")
+                        ForEach(devices.outputs) { Label($0.name, systemImage: AudioDevices.kind($0).icon).tag($0.uid) }
+                        if let missing = live.missingOutput {
+                            Label("\(missing) (not connected)", systemImage: "exclamationmark.circle").tag(live.outputUID)
+                        }
+                    }
+                    LabeledContent("Echo protection", value: echoText)
                     Picker("Chinese voice", selection: $voiceZH) {
                         Text("Automatic").tag("")
                         Section("Natural") { Text("Matcha").tag("neural:matcha") }
@@ -74,10 +112,6 @@ private struct AudioSettings: View {
                     }
                     .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.supertonic.isInstalled { store.download(.supertonic) } }
                     ForEach(VoicePack.allCases) { pack in packRow(pack) }
-                    Picker("Play on", selection: $outputUID) {
-                        Text("System Default").tag("")
-                        ForEach(outputs) { Text($0.name).tag($0.uid) }
-                    }
                 }
                 .disabled(!speak)
             } header: {
@@ -91,10 +125,33 @@ private struct AudioSettings: View {
             }
         }
         .formStyle(.grouped)
-        .onAppear {
-            inputs = AudioDevices.list(input: true)
-            outputs = AudioDevices.list(input: false)
+        .onAppear { devices.refresh() }
+    }
+
+    /// How the microphone is kept from hearing the voice, in words.
+    private var echoText: String {
+        let p = live.audioPlan()
+        if p.source != .microphone { return "Not needed (Interpreto’s voice isn’t captured)" }
+        if !p.protection { return "Not needed (headphones or headset)" }
+        return p.echo ? "Echo cancellation" : "Microphone pauses while the voice speaks"
+    }
+}
+
+/// A small live input level bar.
+struct LevelMeter: View {
+    var level: Float
+
+    var body: some View {
+        // Speech is roughly 0.01–0.1 RMS: show it on a log-like scale.
+        let v = min(1, max(0, (log10(Double(max(level, 0.0005))) + 3.3) / 2.5))
+        GeometryReader { g in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(v > 0.85 ? .orange : .green).frame(width: g.size.width * v)
+            }
         }
+        .frame(width: 160, height: 6)
+        .animation(.linear(duration: 0.08), value: level)
     }
 }
 

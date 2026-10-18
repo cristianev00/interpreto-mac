@@ -325,14 +325,19 @@ extension Recognizer {
                 var energy = 0.0, frames = 0                 // loudness of the current stretch of speech
                 var recent: [Double] = []            // energy fallback: frame levels over the last ~4 s
                 for await buf in input {
+                    guard buf.frameLength > 0, buf.audioBufferList.pointee.mBuffers.mData != nil else { continue }
                     cont.yield(buf)
-                    guard buf.frameLength > 0 else { continue }
                     let n = Int(buf.frameLength)
                     var samples = [Float](repeating: 0, count: n)
-                    if let f = buf.floatChannelData?[0] {
-                        for i in 0..<n { samples[i] = f[i] }
-                    } else if let p = buf.int16ChannelData?[0] {
-                        for i in 0..<n { samples[i] = Float(p[i]) / 32768 }
+                    let list = buf.audioBufferList.pointee.mBuffers
+                    if let data = list.mData {
+                        if buf.format.commonFormat == .pcmFormatFloat32 {
+                            let f = data.assumingMemoryBound(to: Float.self)
+                            for i in 0..<min(n, Int(list.mDataByteSize) / 4) { samples[i] = f[i] }
+                        } else if buf.format.commonFormat == .pcmFormatInt16 {
+                            let p = data.assumingMemoryBound(to: Int16.self)
+                            for i in 0..<min(n, Int(list.mDataByteSize) / 2) { samples[i] = Float(p[i]) / 32768 }
+                        }
                     }
                     let start = t
                     t += Double(n) / buf.format.sampleRate

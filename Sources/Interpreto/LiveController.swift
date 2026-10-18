@@ -23,7 +23,7 @@ final class LiveController {
     var message: String?
 
     let history: HistoryStore
-    private let mic = Microphone()
+    let mic = Microphone()
     private let appleRecognizer = Recognizer()
     private var modelRecognizers: [SpeechEngine: ModelRecognizer] = [:]
     private var recognizer: SpeechRecognizing
@@ -63,14 +63,114 @@ final class LiveController {
 
     /// What Interpreto listens to: the microphone, all Mac sound, or one app.
     var source: ListenSource {
-        get { ListenSource(defaults.string(forKey: Pref.listenSource)) }
-        set {
-            defaults.set(newValue.raw, forKey: Pref.listenSource)
-            sourceVersion += 1
-            if isListening { stop(); Task { try? await Task.sleep(for: .milliseconds(300)); start() } }
-        }
+        get { _ = sourceVersion; return ListenSource(defaults.string(forKey: Pref.listenSource)) }
+        set { listen(to: newValue) }
     }
     private(set) var sourceVersion = 0        // lets views refresh when the source changes
+
+    /// The microphone chosen in the toolbar or Settings ("" = the Mac's default).
+    var micUID: String { _ = sourceVersion; return defaults.string(forKey: Pref.micUID) ?? "" }
+    /// Where the spoken translation plays ("" = the Mac's default output).
+    var outputUID: String { _ = sourceVersion; return defaults.string(forKey: Pref.outputUID) ?? "" }
+
+    /// Listen to a source (and, for the microphone, a specific one), switching at once if listening.
+    func listen(to source: ListenSource, mic uid: String? = nil) {
+        if let uid {
+            defaults.set(uid, forKey: Pref.micUID)
+            // Remember the name, to show it while the device (AirPods…) isn't connected.
+            defaults.set(DeviceMonitor.shared.name(uid, input: true), forKey: "micName")
+        }
+        if source != self.source { defaults.set(source.raw, forKey: Pref.listenSource) }
+        sourceVersion += 1
+        devicesChanged()
+    }
+
+    func setOutput(_ uid: String) {
+        defaults.set(uid, forKey: Pref.outputUID)
+        defaults.set(DeviceMonitor.shared.name(uid, input: false), forKey: "outputName")
+        sourceVersion += 1
+        devicesChanged()
+    }
+
+    /// A chosen device that isn't connected now (its name), while the default is used instead.
+    var missingMic: String? {
+        _ = sourceVersion
+        let uid = micUID, d = DeviceMonitor.shared
+        return uid.isEmpty || d.inputs.contains { $0.uid == uid } ? nil : defaults.string(forKey: "micName") ?? "Microphone"
+    }
+    var missingOutput: String? {
+        _ = sourceVersion
+        let uid = outputUID, d = DeviceMonitor.shared
+        return uid.isEmpty || d.outputs.contains { $0.uid == uid } ? nil : defaults.string(forKey: "outputName") ?? "Speaker"
+    }
+
+    /// The device names the toolbar shows.
+    var inputName: String {
+        guard source == .microphone else { return sourceName }
+        let p = audioPlan()
+        return DeviceMonitor.shared.name(p.mic, input: true).map(Self.short) ?? "Microphone"
+    }
+    var outputName: String {
+        DeviceMonitor.shared.name(audioPlan().output, input: false).map(Self.short) ?? "Speakers"
+    }
+    /// "MacBook Pro Microphone" → "MacBook Pro", "Ever’s iPhone Microphone" → "Ever’s iPhone".
+    static func short(_ name: String) -> String {
+        var n = name
+        for suffix in [" Microphone", " Speakers", " Speaker"] where n.hasSuffix(suffix) && n.count > suffix.count {
+            n = String(n.dropLast(suffix.count))
+        }
+        return n
+    }
+
+    /// Which devices a session uses, and how the microphone is kept from hearing the voice.
+    struct AudioPlan: Equatable {
+        var source: ListenSource
+        var chosenMic: String?        // nil = default input
+        var mic: String?              // the device actually used
+        var output: String?
+        var protection: Bool          // the voice plays where the microphone can hear it
+        var echo: Bool                // ...and Apple's echo cancellation can remove it
+    }
+    private(set) var activePlan: AudioPlan?
+
+    func audioPlan() -> AudioPlan {
+        let monitor = DeviceMonitor.shared
+        // A chosen device that isn't connected right now falls back to the default.
+        let chosenMic = micUID.isEmpty || !monitor.inputs.contains { $0.uid == micUID } ? nil : micUID
+        let chosenOut = outputUID.isEmpty || !monitor.outputs.contains { $0.uid == outputUID } ? nil : outputUID
+        let defaultIn = monitor.defaultInput, defaultOut = monitor.defaultOutput
+        let mic = chosenMic ?? defaultIn, out = chosenOut ?? defaultOut
+        // Listening to the Mac's sound: Interpreto's own voice is excluded from the capture.
+        // On loudspeakers with a microphone that isn't a headset, the mic would hear the voice:
+        // Apple's echo cancellation removes it when both are the system defaults; otherwise the
+        // microphone is muted while the voice plays.
+        let protection = source == .microphone && defaults.bool(forKey: Pref.speak)
+            && AudioDevices.isLoudspeaker(out) && !AudioDevices.isHeadset(mic)
+        return AudioPlan(source: source, chosenMic: chosenMic, mic: mic, output: out, protection: protection,
+                         echo: protection && mic == defaultIn && out == defaultOut)
+    }
+
+    /// Devices were chosen, connected or removed: if the session would now use different
+    /// devices, restart listening with them (a fraction of a second; the session continues).
+    func devicesChanged() {
+        guard isListening, let active = activePlan else { return }
+        let plan = audioPlan()
+        guard plan != active else { return }
+        Diagnostics.event("devices changed while listening: restarting")
+        restart()
+    }
+
+    /// Stops and starts listening again in the same session.
+    private func restart() {
+        guard isListening else { return }
+        isListening = false
+        stopMic()
+        Task {
+            await recognizer.stop()
+            try? await Task.sleep(for: .milliseconds(150))
+            start()
+        }
+    }
 
     /// Short name of the source, for the record button.
     var sourceName: String {
@@ -96,7 +196,7 @@ final class LiveController {
         Task { try? await r.prepare() }
     }
     let translator = Translator()
-    private let speaker = Speaker()
+    let speaker = Speaker()
     private var started = Date()
     private var draftTask: Task<Void, Never>?
     private var draftPending: String?
@@ -111,6 +211,7 @@ final class LiveController {
         direction = d
         session = Session(direction: d)
         recognizer = appleRecognizer
+        DeviceMonitor.shared.onChange = { [weak self] in self?.devicesChanged() }
     }
 
     // MARK: listening
@@ -129,24 +230,11 @@ final class LiveController {
             }
             if session.items.isEmpty { session = Session(direction: direction); started = Date() }
             else if session.direction != direction { newSession(); started = Date() }
-            let device = AudioDevices.id(forUID: defaults.string(forKey: Pref.micUID), input: true)
-            // Voice on the normal speakers: play it through the microphone's engine so Apple's
-            // echo cancellation removes it from what the mic hears, and the speaker can keep
-            // talking. With headphones or a virtual cable chosen, there's no echo to cancel.
-            // Protect against the microphone hearing the spoken translation when it plays on
-            // loudspeakers and the microphone isn't a headset. Apple's echo cancellation works with
-            // the system's default devices; otherwise the microphone is muted while the voice plays.
-            let chosenMic = (defaults.string(forKey: Pref.micUID) ?? "").isEmpty ? nil : defaults.string(forKey: Pref.micUID)
-            let chosenOut = (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty ? nil : defaults.string(forKey: Pref.outputUID)
-            let defaultIn = AudioDevices.defaultUID(input: true), defaultOut = AudioDevices.defaultUID(input: false)
-            let micUID = chosenMic ?? defaultIn, outUID = chosenOut ?? defaultOut
-            let source = ListenSource(defaults.string(forKey: Pref.listenSource))
-            // Listening to the Mac's sound: Interpreto's own voice is excluded from the capture.
-            let needsProtection = source == .microphone && defaults.bool(forKey: Pref.speak)
-                && AudioDevices.isLoudspeaker(outUID) && !AudioDevices.isHeadset(micUID)
-            let echo = needsProtection && micUID == defaultIn && outUID == defaultOut
-            mic.muteWhileSpeaking = needsProtection
-            Diagnostics.event("devices: mic \(micUID ?? "-"), output \(outUID ?? "-"); protection \(needsProtection), echo cancellation \(echo)")
+            let plan = audioPlan()
+            activePlan = plan
+            let echo = plan.echo
+            mic.muteWhileSpeaking = plan.protection
+            Diagnostics.event("devices: mic \(plan.mic ?? "-"), output \(plan.output ?? "-"); protection \(plan.protection), echo cancellation \(echo)")
             mic.freshEngine()
             speaker.use(engine: echo ? mic.engine : nil)
             var lastLevelLog = Date.distantPast
@@ -164,13 +252,23 @@ final class LiveController {
                 try await recognizer.start(
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
                     input: { [mic] format in
+                        // Echo cancellation runs on the default devices and mustn't be pointed at a device.
                         Diagnostics.event("listening: \(self.direction.label), echo cancellation \(echo), recognizer format \(format)")
-                        return Diagnostics.tap(try mic.start(uid: self.defaults.string(forKey: Pref.micUID), format: format, echoCancellation: echo, source: source), format: format)
+                        return Diagnostics.tap(try mic.start(uid: echo ? nil : plan.mic, format: format, echoCancellation: echo, source: plan.source), format: format)
                     },
                     onPartial: { [weak self] in self?.partialChanged($0) },
                     onCommit: { [weak self] id, text, start, end in self?.committed(id, text, start, end) },
                     onRevise: { [weak self] id, text in self?.revised(id, text) },
                     onError: { [weak self] e in self?.message = e.localizedDescription; self?.stop() })
+                // Echo cancellation takes about a second to warm up: show "Starting…" until the
+                // microphone really delivers, so the first words aren't lost.
+                if plan.source == .microphone {
+                    let t0 = Date()
+                    while mic.buffersReceived < 12, Date().timeIntervalSince(t0) < 3 {
+                        try? await Task.sleep(for: .milliseconds(30))
+                    }
+                    Diagnostics.event(String(format: "mic: sound flowing after %.2f s (%d buffers)", Date().timeIntervalSince(t0), mic.buffersReceived))
+                }
                 isListening = true
                 listeningSince = Date()
             } catch {
@@ -255,13 +353,8 @@ final class LiveController {
     /// microphone; the session continues).
     func speakingChanged(_ on: Bool) {
         if !on { speaker.stop() }
-        guard isListening else { return }
-        isListening = false
-        mic.stop()
-        Task {
-            await recognizer.stop()
-            start()
-        }
+        sourceVersion += 1
+        devicesChanged()
     }
 
     // MARK: recognition events

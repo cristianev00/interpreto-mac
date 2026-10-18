@@ -80,14 +80,8 @@ struct LiveView: View {
         .onChange(of: live.session.id) { following = true }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                SourceMenu()
-
-                Toggle(isOn: $speak) {
-                    Label("Speak Translation", systemImage: speak ? "speaker.wave.2.fill" : "speaker.slash")
-                }
-                .toggleStyle(.button)
-                .help(speak ? "Speaking the translation aloud" : "Speak the translation aloud")
-                .onChange(of: speak) { _, on in live.speakingChanged(on) }
+                InputMenu()
+                OutputMenu()
 
                 Button { SubtitlePanel.shared.toggle(live) } label: {
                     Label("Subtitles", systemImage: "pip")
@@ -108,6 +102,9 @@ struct LiveView: View {
                     Label("New Session", systemImage: "square.and.pencil")
                 }
                 .help("New session (⌘N)")
+
+                SettingsButton(tab: .audio, title: "Settings", icon: "gearshape")
+                    .help("Settings (⌘,)")
             }
         }
     }
@@ -262,33 +259,119 @@ struct RecordCapsule: View {
 }
 
 /// "Listen to": the microphone, all sound on this Mac, or one app (Zoom, Teams, a browser…).
-struct SourceMenu: View {
+/// Toolbar: what Interpreto listens to (a microphone, all Mac sound, or one app).
+struct InputMenu: View {
     @Environment(LiveController.self) private var live
+    private var devices: DeviceMonitor { .shared }
+
+    private var selection: Binding<String> {
+        Binding(get: { live.source == .microphone ? "mic:" + live.micUID : live.source.raw },
+                set: { token in
+                    if token.hasPrefix("mic:") { live.listen(to: .microphone, mic: String(token.dropFirst(4))) }
+                    else { live.listen(to: ListenSource(token)) }
+                })
+    }
 
     var body: some View {
-        let current = live.source
+        let apps = SystemAudio.apps()
         Menu {
-            Picker("Listen to", selection: Binding(get: { current }, set: { live.source = $0 })) {
-                Label("Microphone", systemImage: "mic").tag(ListenSource.microphone)
-                Label("All sound on this Mac", systemImage: "macbook").tag(ListenSource.allApps)
-            }
-            .pickerStyle(.inline)
-            let apps = SystemAudio.apps()
-            if !apps.isEmpty {
-                Section("An app") {
-                    ForEach(apps) { app in
-                        Button {
-                            live.source = .app(app.id)
-                        } label: {
-                            if current == .app(app.id) { Label(app.name, systemImage: "checkmark") }
-                            else { Text(app.playing ? "\(app.name)  ♪" : app.name) }
-                        }
-                    }
+            Picker("Microphone", selection: selection) {
+                Label("Default — \(devices.name(devices.defaultInput, input: true) ?? "None")", systemImage: "mic")
+                    .tag("mic:")
+                ForEach(devices.inputs) { d in
+                    Label(d.name, systemImage: AudioDevices.kind(d).icon).tag("mic:" + d.uid)
+                }
+                if let missing = live.missingMic {
+                    Label("\(missing) — not connected", systemImage: "exclamationmark.circle").tag("mic:" + live.micUID)
                 }
             }
+            .pickerStyle(.inline)
+            Picker("This Mac’s Sound", selection: selection) {
+                Label("All Sound on This Mac", systemImage: "macbook").tag("all")
+                ForEach(apps) { app in
+                    Label(app.name, systemImage: app.playing ? "speaker.wave.2.fill" : "app").tag("app:" + app.id)
+                }
+            }
+            .pickerStyle(.inline)
+            Divider()
+            SettingsButton(tab: .audio, title: "Audio Settings…")
         } label: {
-            Label("Listen to", systemImage: current == .microphone ? "mic" : "speaker.wave.2.circle")
+            Label(live.inputName, systemImage: live.source == .microphone ? "mic.fill" : "speaker.wave.2.circle.fill")
+                .labelStyle(.titleAndIcon)
         }
-        .help("Listen to: \(live.sourceName)")
+        .fixedSize()
+        .help("Listening to \(live.inputName). Click to choose a microphone or this Mac’s sound.")
+    }
+}
+
+/// Toolbar: speak the translation, and where. Clicking toggles the voice; the arrow opens the menu.
+struct OutputMenu: View {
+    @Environment(LiveController.self) private var live
+    @AppStorage(Pref.speak) private var speak = false
+    @AppStorage(Pref.voiceZH) private var voiceZH = ""
+    @AppStorage(Pref.voiceEN) private var voiceEN = ""
+    private var devices: DeviceMonitor { .shared }
+
+    var body: some View {
+        let zh = live.direction.targetVoiceLanguage == "zh-CN"
+        Menu {
+            Toggle("Speak the Translation", isOn: $speak)
+            Picker("Play On", selection: Binding(get: { live.outputUID }, set: { live.setOutput($0) })) {
+                Label("Default — \(devices.name(devices.defaultOutput, input: false) ?? "None")", systemImage: "speaker.wave.2")
+                    .tag("")
+                ForEach(devices.outputs) { d in
+                    Label(d.name, systemImage: AudioDevices.kind(d).icon).tag(d.uid)
+                }
+                if let missing = live.missingOutput {
+                    Label("\(missing) — not connected", systemImage: "exclamationmark.circle").tag(live.outputUID)
+                }
+            }
+            .pickerStyle(.inline)
+            .disabled(!speak)
+            Picker(zh ? "Chinese Voice" : "English Voice", selection: zh ? $voiceZH : $voiceEN) {
+                Text("Automatic").tag("")
+                if zh {
+                    Text("Matcha (natural)").tag("neural:matcha")
+                } else {
+                    ForEach(0..<10, id: \.self) { Text("\(VoicePack.supertonicName($0)) (natural)").tag("neural:supertonic:\($0)") }
+                }
+                Divider()
+                ForEach(Speaker.voices(for: live.direction.targetVoiceLanguage), id: \.identifier) {
+                    Text(Speaker.label($0)).tag($0.identifier)
+                }
+            }
+            .disabled(!speak)
+            Divider()
+            SettingsButton(tab: .audio, title: "Audio Settings…")
+        } label: {
+            Label(speak ? live.outputName : "Voice Off",
+                  systemImage: speak ? "speaker.wave.2.fill" : "speaker.slash")
+                .labelStyle(.titleAndIcon)
+        } primaryAction: {
+            speak.toggle()
+        }
+        .fixedSize()
+        .help(speak ? "Speaking on \(live.outputName). Click to turn the voice off." : "Click to speak the translation aloud.")
+        .onChange(of: speak) { _, on in live.speakingChanged(on) }
+        .onChange(of: voiceZH) { _, v in if v.hasPrefix("neural:"), !VoicePack.matcha.isInstalled { ModelStore.shared.download(.matcha) } }
+        .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.supertonic.isInstalled { ModelStore.shared.download(.supertonic) } }
+    }
+}
+
+/// Opens the Settings window on a given tab.
+struct SettingsButton: View {
+    @Environment(\.openSettings) private var openSettings
+    @AppStorage("settingsTab") private var settingsTab = SettingsTab.speech
+    var tab: SettingsTab
+    var title = "Settings…"
+    var icon: String?
+
+    var body: some View {
+        Button {
+            settingsTab = tab
+            openSettings()
+        } label: {
+            if let icon { Label(title, systemImage: icon) } else { Text(title) }
+        }
     }
 }

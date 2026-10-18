@@ -119,9 +119,13 @@ final class ModelRecognizer: SpeechRecognizing {
     // MARK: audio
 
     private func feed(_ buf: AVAudioPCMBuffer) async {
-        guard let ch = buf.floatChannelData?[0] else { return }
-        let n = Int(buf.frameLength)
-        samples.append(contentsOf: UnsafeBufferPointer(start: ch, count: n))
+        // A device that's being reconfigured can hand over a buffer without memory.
+        // Read the samples from the buffer list itself, never past its real size.
+        let list = buf.audioBufferList.pointee.mBuffers
+        guard buf.format.commonFormat == .pcmFormatFloat32, let data = list.mData else { return }
+        let n = min(Int(buf.frameLength), Int(list.mDataByteSize) / MemoryLayout<Float>.size)
+        guard n > 0 else { return }
+        samples.append(contentsOf: UnsafeBufferPointer(start: data.assumingMemoryBound(to: Float.self), count: n))
         time += Double(n) / Self.rate
         if !speaking {
             // Before speech: keep only a short pre-roll.
