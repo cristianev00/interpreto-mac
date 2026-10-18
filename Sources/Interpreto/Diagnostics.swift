@@ -47,7 +47,7 @@ enum Diagnostics {
     }
 
     /// Wraps the recognizer's input so it is also saved to heard.caf while recording.
-    static func tap(_ input: AsyncStream<AnalyzerInput>, format: AVAudioFormat) -> AsyncStream<AnalyzerInput> {
+    static func tap(_ input: AudioStream, format: AVAudioFormat) -> AudioStream {
         guard isRecording, let dir = lock.withLock({ folder }) else { return input }
         let file = try? AVAudioFile(forWriting: dir.appending(path: "heard.caf"), settings: format.settings,
                                     commonFormat: format.commonFormat, interleaved: format.isInterleaved)
@@ -55,7 +55,7 @@ enum Diagnostics {
         return AsyncStream { cont in
             let task = Task.detached {
                 for await x in input {
-                    lock.withLock { try? audio?.write(from: x.buffer) }
+                    lock.withLock { try? audio?.write(from: x) }
                     cont.yield(x)
                 }
                 cont.finish()

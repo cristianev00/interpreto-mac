@@ -97,6 +97,7 @@ struct ContentView: View {
         }
         .task {
             await readiness.check()
+            live.preloadEngine()
             if CommandLine.arguments.contains("--diagnose") { live.recordDiagnostics() }
         }
         .alert("Interpreto", isPresented: Binding(get: { live.message != nil }, set: { if !$0 { live.message = nil } })) {
@@ -125,6 +126,9 @@ struct DirectionPicker: View {
 
 struct StatusFooter: View {
     @Environment(LiveController.self) private var live
+    // Re-render when the engine choice changes in Settings.
+    @AppStorage(Pref.engineEN) private var engineEN = ""
+    @AppStorage(Pref.engineZH) private var engineZH = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -133,6 +137,9 @@ struct StatusFooter: View {
             } icon: {
                 Circle().fill(live.isListening ? .red : .green).frame(width: 7, height: 7)
             }
+            Label("Speech: \(live.engineName)", systemImage: "waveform")
+                .foregroundStyle(.secondary)
+                .help("Change in Settings → Speech")
             if let d = live.lastDelay {
                 Label(String(format: "Translated in %.2f s", d), systemImage: "bolt.fill")
                     .foregroundStyle(.secondary)

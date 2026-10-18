@@ -2,6 +2,9 @@ import AVFoundation
 import CoreMedia
 import Speech
 
+/// Audio as it flows between the microphone, pause detection and the speech engines.
+typealias AudioStream = AsyncStream<AVAudioPCMBuffer>
+
 /// Apple's on-device speech recognition (SpeechAnalyzer), tuned for live translation.
 ///
 /// Apple confirms ("finalizes") a sentence only when it has heard more context, which in practice
@@ -54,7 +57,7 @@ final class Recognizer {
     /// - onCommit(id, text, start, end): a new sentence (audio times in seconds)
     /// - onRevise(id, text): Apple's confirmed wording for an earlier sentence differs
     func start(direction d: Direction, vocabulary: [String],
-               input: (AVAudioFormat) throws -> AsyncStream<AnalyzerInput>,
+               input: (AVAudioFormat) throws -> AudioStream,
                onPartial: @escaping (String) -> Void,
                onCommit: @escaping (UUID, String, Double, Double) -> Void,
                onRevise: @escaping (UUID, String) -> Void,
@@ -79,8 +82,8 @@ final class Recognizer {
                           userInfo: [NSLocalizedDescriptionKey: "Speech recognition isn’t available for \(d.sourceName)."])
         }
         try await analyzer.prepareToAnalyze(in: format)
-        let stream = Self.withPauseDetection(try input(format)) { [weak self] speechEnd in
-            Task { @MainActor in self?.paused(at: speechEnd.0, long: speechEnd.1) }
+        let stream = Self.withPauseDetection(try input(format)) { [weak self] event in
+            if case .paused(let end, let long) = event { Task { @MainActor in self?.paused(at: end, long: long) } }
         }
 
         resultsTask = Task { @MainActor [weak self] in
@@ -98,7 +101,15 @@ final class Recognizer {
             } catch is CancellationError {
             } catch { onError(error) }
         }
-        try await analyzer.start(inputSequence: stream)
+        // Apple's analyzer takes its own input type (only in its own audio format).
+        let analyzerInput = AsyncStream<AnalyzerInput> { cont in
+            let task = Task.detached {
+                for await buffer in stream { cont.yield(AnalyzerInput(buffer: buffer)) }
+                cont.finish()
+            }
+            cont.onTermination = { _ in task.cancel() }
+        }
+        try await analyzer.start(inputSequence: analyzerInput)
     }
 
     /// Finishes the current audio (so the last sentence is confirmed) and stops.
@@ -278,44 +289,96 @@ private extension Character {
 
 extension Recognizer {
 
-    /// Passes the audio through unchanged, calling `onPause(endOfSpeech)` when speech is followed
-    /// by a pause. Speech is energy well above an adaptive noise floor.
-    nonisolated static func withPauseDetection(_ input: AsyncStream<AnalyzerInput>,
-                                               onPause: @escaping @Sendable ((Double, Bool)) -> Void) -> AsyncStream<AnalyzerInput> {
+    /// Speech starting and pausing, as heard by the voice-activity detector.
+    enum SpeechEvent: Sendable {
+        case started(Double)                 // audio time speech began
+        case paused(Double, long: Bool)      // audio time speech ended; short (0.5 s) or long (1 s) pause
+    }
+
+    /// Passes the audio through unchanged, reporting when speech starts and pauses. Uses Silero VAD
+    /// (a small neural voice-activity model, bundled), which tells speech from silence and noise
+    /// reliably, including during long uninterrupted speech; falls back to an energy detector.
+    nonisolated static func withPauseDetection(_ input: AudioStream,
+                                               onEvent: @escaping @Sendable (SpeechEvent) -> Void) -> AudioStream {
         AsyncStream { cont in
             let task = Task.detached {
-                var t = 0.0, lastSpeech: Double?, reported = 0      // pauses reported for lastSpeech: 0, 1 (short), 2 (long)
-                var recent: [Double] = []                  // frame levels over the last ~4 s
-                for await item in input {
-                    cont.yield(item)
-                    let buf = item.buffer
+                let vad = VoiceActivity.make()
+                var t = 0.0, lastSpeech: Double?, reported = 0, inSpeech = false
+                var recent: [Double] = []            // energy fallback: frame levels over the last ~4 s
+                for await buf in input {
+                    cont.yield(buf)
                     guard buf.frameLength > 0 else { continue }
                     let n = Int(buf.frameLength)
-                    var sum = 0.0
+                    var samples = [Float](repeating: 0, count: n)
                     if let f = buf.floatChannelData?[0] {
-                        for i in 0..<n { sum += Double(f[i] * f[i]) }
+                        for i in 0..<n { samples[i] = f[i] }
                     } else if let p = buf.int16ChannelData?[0] {
-                        for i in 0..<n { let v = Double(p[i]) / 32768; sum += v * v }
+                        for i in 0..<n { samples[i] = Float(p[i]) / 32768 }
                     }
-                    let rms = (sum / Double(n)).squareRoot()
+                    let start = t
                     t += Double(n) / buf.format.sampleRate
-                    // Noise floor: the typical quiet level of the last few seconds (20th percentile),
-                    // not the single quietest moment, which echo cancellation can push near zero.
-                    let frames = max(20, Int(4.0 * buf.format.sampleRate / Double(n)))
-                    recent.append(rms)
-                    if recent.count > frames { recent.removeFirst(recent.count - frames) }
-                    let floor = recent.count < 10 ? 0.001 : recent.sorted()[recent.count / 5]
-                    if rms > max(floor * 3, 0.0015) {
+                    let speech: Bool
+                    if let vad, buf.format.sampleRate == 16_000 {
+                        speech = vad.isSpeech(samples)
+                    } else {
+                        let rms = Double((samples.reduce(0) { $0 + $1 * $1 } / Float(n)).squareRoot())
+                        let frames = max(20, Int(4.0 * buf.format.sampleRate / Double(n)))
+                        recent.append(rms)
+                        if recent.count > frames { recent.removeFirst(recent.count - frames) }
+                        let floor = recent.count < 10 ? 0.001 : recent.sorted()[recent.count / 5]
+                        speech = rms > max(floor * 3, 0.0015)
+                    }
+                    if speech {
+                        if !inSpeech { inSpeech = true; onEvent(.started(max(0, start - VoiceActivity.lag))) }
                         lastSpeech = t
                         reported = 0
                     } else if let s = lastSpeech {
-                        if reported < 1, t - s >= pauseSeconds { onPause((s, false)); reported = 1 }
-                        if reported < 2, t - s >= longPauseSeconds { onPause((s, true)); reported = 2; lastSpeech = nil }
+                        // The detector holds "speech" a little past its end; measure from the true end.
+                        let end = vad == nil ? s : max(0, s - VoiceActivity.lag)
+                        if reported < 1, t - end >= pauseSeconds {
+                            onEvent(.paused(end, long: false)); reported = 1
+                            inSpeech = false                 // speaking again reports a new start
+                        }
+                        if reported < 2, t - end >= longPauseSeconds {
+                            onEvent(.paused(end, long: true)); reported = 2; lastSpeech = nil; inSpeech = false
+                        }
                     }
                 }
                 cont.finish()
             }
             cont.onTermination = { _ in task.cancel() }
         }
+    }
+}
+
+/// Silero VAD through sherpa-onnx (model bundled in the app's Resources).
+final class VoiceActivity {
+    static let lag = 0.15                    // minimum silence the detector waits before "not speech"
+    private let vad: SherpaOnnxVoiceActivityDetectorWrapper
+
+    private init(_ vad: SherpaOnnxVoiceActivityDetectorWrapper) { self.vad = vad }
+
+    static var modelPath: String? {
+        if let url = Bundle.main.url(forResource: "silero_vad", withExtension: "onnx") { return url.path }
+        // Development builds run from .build: use the project's copy.
+        let dev = URL(fileURLWithPath: #filePath).deletingLastPathComponent()      // Engine
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appending(path: "Resources/silero_vad.onnx").path
+        return FileManager.default.fileExists(atPath: dev) ? dev : nil
+    }
+
+    static func make() -> VoiceActivity? {
+        guard let path = modelPath else { return nil }
+        let silero = sherpaOnnxSileroVadModelConfig(model: path, threshold: 0.5, minSilenceDuration: Float(lag),
+                                                    minSpeechDuration: 0.15, windowSize: 512, maxSpeechDuration: 60)
+        var config = sherpaOnnxVadModelConfig(sileroVad: silero, sampleRate: 16_000, numThreads: 1)
+        return VoiceActivity(SherpaOnnxVoiceActivityDetectorWrapper(config: &config, buffer_size_in_seconds: 30))
+    }
+
+    /// Feeds 16 kHz samples; true while the detector considers the speaker to be talking.
+    func isSpeech(_ samples: [Float]) -> Bool {
+        vad.acceptWaveform(samples: samples)
+        while !vad.isEmpty() { vad.pop() }            // we only need the live state, not segments
+        return vad.isSpeechDetected()
     }
 }

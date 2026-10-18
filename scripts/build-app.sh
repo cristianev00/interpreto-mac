@@ -1,14 +1,31 @@
 #!/bin/bash
 # Builds build/Interpreto.app (release, Apple silicon) and signs it for this Mac.
+#   ./scripts/build-app.sh             build
+#   ./scripts/build-app.sh --install   build, then replace /Applications/Interpreto.app
 set -euo pipefail
 cd "$(dirname "$0")/.."
+./scripts/fetch-vendor.sh
 swift build -c release --arch arm64
 APP=build/Interpreto.app
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$(swift build -c release --arch arm64 --show-bin-path)/Interpreto" "$APP/Contents/MacOS/"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
+BIN="$APP/Contents/MacOS/Interpreto"
+cp "$(swift build -c release --arch arm64 --show-bin-path)/Interpreto" "$BIN"
+# The development rpath points into this project; the app uses Contents/Frameworks only.
+install_name_tool -delete_rpath "$PWD/Vendor/sherpa-onnx/lib" "$BIN" 2>/dev/null || true
 cp Resources/Info.plist "$APP/Contents/"
-cp Resources/AppIcon.icns "$APP/Contents/Resources/"
+cp Resources/AppIcon.icns Resources/silero_vad.onnx "$APP/Contents/Resources/"
+# sherpa-onnx (SenseVoice and voice-activity detection) and the ONNX runtime it uses.
+cp Vendor/sherpa-onnx/lib/libsherpa-onnx-c-api.dylib Vendor/sherpa-onnx/lib/libonnxruntime.dylib "$APP/Contents/Frameworks/"
 # Ad-hoc signature (runs on this Mac). For other Macs: sign with a Developer ID and notarize.
+codesign --force --sign - "$APP"/Contents/Frameworks/*.dylib
 codesign --force --sign - --options runtime --entitlements Resources/Interpreto.entitlements "$APP"
+codesign --verify --deep "$APP"
 du -sh "$APP"
+if [ "${1:-}" = "--install" ]; then
+    pkill -f "/Applications/Interpreto.app/Contents/MacOS/Interpreto" || true
+    rm -rf /Applications/Interpreto.app
+    ditto "$APP" /Applications/Interpreto.app
+    rm -rf "$APP"                      # keep a single Interpreto on this Mac
+    echo "installed in /Applications"
+fi

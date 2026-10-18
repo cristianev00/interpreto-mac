@@ -4,6 +4,7 @@ import SwiftUI
 struct SettingsView: View {
     var body: some View {
         TabView {
+            Tab("Speech", systemImage: "person.wave.2") { EngineSettings() }
             Tab("Audio", systemImage: "waveform") { AudioSettings() }
             Tab("Display", systemImage: "textformat.size") { DisplaySettings() }
             Tab("Glossary", systemImage: "character.book.closed") { GlossarySettings() }
@@ -127,5 +128,71 @@ func openVoiceSettings() {
                 "x-apple.systempreferences:com.apple.Accessibility-Settings.extension"]
     for u in urls {
         if let url = URL(string: u), NSWorkspace.shared.open(url) { return }
+    }
+}
+
+/// Which engine recognizes each spoken language: Apple's (built in) or a downloaded model.
+private struct EngineSettings: View {
+    @Environment(LiveController.self) private var live
+    @AppStorage(Pref.engineEN) private var english = SpeechEngine.apple.rawValue
+    @AppStorage(Pref.engineZH) private var chinese = SpeechEngine.apple.rawValue
+    private var store: ModelStore { .shared }
+
+    var body: some View {
+        Form {
+            section("When English is spoken", direction: .enToZh, selection: $english,
+                    note: "Parakeet made about 30% fewer mistakes than Apple on English spoken with 22 different accents, at the same speed.")
+            section("When Chinese is spoken", direction: .zhToEn, selection: $chinese,
+                    note: "SenseVoice made about 25% fewer mistakes than Apple on Mandarin, and is trained on many regional accents.")
+            Section {
+            } footer: {
+                Text("Models run entirely on this Mac. If a model isn’t downloaded yet, Apple’s engine is used.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .onAppear { store.refresh() }
+    }
+
+    @ViewBuilder
+    private func section(_ title: String, direction: Direction, selection: Binding<String>, note: String) -> some View {
+        Section {
+            Picker("Speech engine", selection: selection) {
+                ForEach(SpeechEngine.options(for: direction)) { Text($0.title).tag($0.rawValue) }
+            }
+            .onChange(of: selection.wrappedValue) { _, value in
+                if let e = SpeechEngine(rawValue: value), e != .apple, store.state(e) != .installed { store.download(e) }
+                live.preloadEngine()
+            }
+            ForEach(SpeechEngine.options(for: direction).filter { $0 != .apple }) { e in
+                modelRow(e)
+            }
+        } header: {
+            Text(title)
+        } footer: {
+            Text(note).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func modelRow(_ e: SpeechEngine) -> some View {
+        LabeledContent(e == .parakeet ? "Parakeet model" : "SenseVoice model") {
+            switch store.state(e) {
+            case .installed:
+                HStack {
+                    Label("Downloaded", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                    Button("Remove") { store.remove(e) }.buttonStyle(.borderless)
+                }
+            case .downloading(let p):
+                ProgressView(value: p).frame(width: 160)
+            case .notInstalled:
+                Button("Download (\(e.downloadSize))") { store.download(e) }
+            case .failed(let message):
+                HStack {
+                    Text(message).foregroundStyle(.red).lineLimit(1)
+                    Button("Try Again") { store.download(e) }
+                }
+            }
+        }
     }
 }

@@ -2,3 +2,5 @@
 build/
 *.xcodeproj/
 .swiftpm/
+Vendor/sherpa-onnx/lib/
+Vendor/dl/

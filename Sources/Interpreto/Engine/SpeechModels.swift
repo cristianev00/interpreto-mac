@@ -1,0 +1,205 @@
+import FluidAudio
+import Foundation
+import Observation
+
+/// Speech-recognition engines. Apple's is built in; the others are downloaded once and measured to
+/// be more accurate: Parakeet made ~30% fewer errors than Apple on accented English (22 accents),
+/// SenseVoice ~25% fewer on Mandarin.
+enum SpeechEngine: String, CaseIterable, Identifiable {
+    case apple, parakeet, sensevoice
+    var id: String { rawValue }
+
+    static func options(for d: Direction) -> [SpeechEngine] {
+        d == .enToZh ? [.apple, .parakeet] : [.apple, .sensevoice]
+    }
+
+    static func chosen(for d: Direction) -> SpeechEngine {
+        let key = d == .enToZh ? Pref.engineEN : Pref.engineZH
+        return SpeechEngine(rawValue: UserDefaults.standard.string(forKey: key) ?? "") ?? .apple
+    }
+
+    var title: String {
+        switch self {
+        case .apple: "Apple (built in)"
+        case .parakeet: "Parakeet — best with accents"
+        case .sensevoice: "SenseVoice — most accurate Chinese"
+        }
+    }
+
+    var downloadSize: String {
+        switch self {
+        case .apple: ""
+        case .parakeet: "about 480 MB"
+        case .sensevoice: "about 230 MB"
+        }
+    }
+}
+
+/// Downloads and keeps the optional speech models in ~/Library/Application Support/Interpreto/Models.
+@MainActor
+@Observable
+final class ModelStore {
+    static let shared = ModelStore()
+
+    enum State: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
+    private(set) var states: [SpeechEngine: State] = [:]
+
+    nonisolated static let folder = URL.applicationSupportDirectory.appending(path: "Interpreto/Models", directoryHint: .isDirectory)
+    nonisolated static var parakeetFolder: URL { folder.appending(path: "parakeet", directoryHint: .isDirectory) }
+    nonisolated static var senseVoiceFolder: URL { folder.appending(path: "sensevoice", directoryHint: .isDirectory) }
+    nonisolated static let senseVoiceFiles = ["model.int8.onnx", "tokens.txt"]
+    nonisolated static let senseVoiceRepo = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+
+    init() { refresh() }
+
+    func state(_ e: SpeechEngine) -> State { e == .apple ? .installed : states[e] ?? .notInstalled }
+
+    func refresh() {
+        for e in [SpeechEngine.parakeet, .sensevoice] {
+            if case .downloading = states[e] { continue }
+            states[e] = Self.isInstalled(e) ? .installed : .notInstalled
+        }
+    }
+
+    nonisolated static func isInstalled(_ e: SpeechEngine) -> Bool {
+        switch e {
+        case .apple: true
+        case .parakeet: AsrModels.modelsExist(at: parakeetFolder, version: .v3)
+        case .sensevoice: senseVoiceFiles.allSatisfy {
+            FileManager.default.fileExists(atPath: senseVoiceFolder.appending(path: $0).path)
+        }
+        }
+    }
+
+    func download(_ e: SpeechEngine) {
+        if case .downloading = state(e) { return }
+        states[e] = .downloading(0)
+        Task {
+            do {
+                await Self.chooseMirror()
+                switch e {
+                case .apple: break
+                case .parakeet:
+                    _ = try await AsrModels.download(to: Self.parakeetFolder, version: .v3) { p in
+                        Task { @MainActor in ModelStore.shared.states[.parakeet] = .downloading(p.fractionCompleted) }
+                    }
+                case .sensevoice:
+                    try await downloadSenseVoice()
+                }
+                states[e] = Self.isInstalled(e) ? .installed : .failed("The download didn’t complete.")
+            } catch {
+                states[e] = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func remove(_ e: SpeechEngine) {
+        // FluidAudio keeps Parakeet in a folder named after its repository, next to ours.
+        let dirs = e == .parakeet ? [Self.parakeetFolder, Self.folder.appending(path: "parakeet-tdt-0.6b-v3")]
+                                  : [Self.senseVoiceFolder]
+        for d in dirs where FileManager.default.fileExists(atPath: d.path) {
+            try? FileManager.default.trashItem(at: d, resultingItemURL: nil)
+        }
+        refresh()
+    }
+
+    // MARK: downloads
+
+    private static var hfBase = "https://huggingface.co"
+
+    /// huggingface.co is blocked in mainland China: use its mirror when it can't be reached.
+    private static func chooseMirror() async {
+        var req = URLRequest(url: URL(string: "https://huggingface.co")!, timeoutInterval: 5)
+        req.httpMethod = "HEAD"
+        let reachable = (try? await URLSession.shared.data(for: req)) != nil
+        hfBase = reachable ? "https://huggingface.co" : "https://hf-mirror.com"
+        ModelRegistry.baseURL = hfBase
+    }
+
+    private func downloadSenseVoice() async throws {
+        let dir = Self.senseVoiceFolder
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        for (i, name) in Self.senseVoiceFiles.enumerated() {
+            let dest = dir.appending(path: name)
+            if FileManager.default.fileExists(atPath: dest.path) { continue }
+            let url = URL(string: "\(Self.hfBase)/\(Self.senseVoiceRepo)/resolve/main/\(name)")!
+            let share = 1.0 / Double(Self.senseVoiceFiles.count)
+            let tmp = try await Self.fetch(url) { p in
+                Task { @MainActor in ModelStore.shared.states[.sensevoice] = .downloading((Double(i) + p) * share) }
+            }
+            try FileManager.default.moveItem(at: tmp, to: dest)
+        }
+    }
+
+    /// Downloads to a temporary file, reporting progress (0…1).
+    private static func fetch(_ url: URL, progress: @escaping @Sendable (Double) -> Void) async throws -> URL {
+        try await withCheckedThrowingContinuation { cont in
+            let box = ObservationBox()
+            let task = URLSession.shared.downloadTask(with: url) { tmp, response, error in
+                box.observation?.invalidate()
+                if let error { cont.resume(throwing: error); return }
+                guard let tmp, (response as? HTTPURLResponse)?.statusCode == 200 else {
+                    cont.resume(throwing: URLError(.badServerResponse)); return
+                }
+                // The system deletes `tmp` when this handler returns: move it somewhere we own.
+                let keep = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+                do { try FileManager.default.moveItem(at: tmp, to: keep); cont.resume(returning: keep) }
+                catch { cont.resume(throwing: error) }
+            }
+            box.observation = task.progress.observe(\.fractionCompleted) { p, _ in progress(p.fractionCompleted) }
+            task.resume()
+        }
+    }
+}
+
+private final class ObservationBox: @unchecked Sendable {
+    var observation: NSKeyValueObservation?
+}
+
+// MARK: - The models
+
+/// A speech model that transcribes a whole utterance (16 kHz mono samples) at a time.
+protocol UtteranceModel: Sendable {
+    func transcribe(_ samples: [Float]) async throws -> String
+}
+
+/// NVIDIA Parakeet TDT 0.6B v3 on the Neural Engine (FluidAudio).
+actor ParakeetModel: UtteranceModel {
+    private let manager = AsrManager(config: .default)
+
+    static func load() async throws -> ParakeetModel {
+        let m = ParakeetModel()
+        let models = try await AsrModels.load(from: ModelStore.parakeetFolder, version: .v3)
+        try await m.manager.loadModels(models)
+        return m
+    }
+
+    func transcribe(_ samples: [Float]) async throws -> String {
+        guard samples.count >= 4_000 else { return "" }               // < 0.25 s
+        var state = TdtDecoderState.make()
+        return try await manager.transcribe(samples, decoderState: &state, language: .english).text
+    }
+}
+
+/// Alibaba SenseVoice-Small (int8) on the CPU (sherpa-onnx).
+actor SenseVoiceModel: UtteranceModel {
+    private let recognizer: SherpaOnnxOfflineRecognizer
+
+    private init(recognizer: SherpaOnnxOfflineRecognizer) { self.recognizer = recognizer }
+
+    static func load() throws -> SenseVoiceModel {
+        let dir = ModelStore.senseVoiceFolder
+        let senseVoice = sherpaOnnxOfflineSenseVoiceModelConfig(
+            model: dir.appending(path: "model.int8.onnx").path, language: "zh", useInverseTextNormalization: true)
+        let model = sherpaOnnxOfflineModelConfig(tokens: dir.appending(path: "tokens.txt").path,
+                                                 numThreads: 4, senseVoice: senseVoice)
+        var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80),
+                                                       modelConfig: model)
+        return SenseVoiceModel(recognizer: SherpaOnnxOfflineRecognizer(config: &config))
+    }
+
+    func transcribe(_ samples: [Float]) async throws -> String {
+        guard samples.count >= 4_000 else { return "" }
+        return recognizer.decode(samples: samples, sampleRate: 16_000).text
+    }
+}

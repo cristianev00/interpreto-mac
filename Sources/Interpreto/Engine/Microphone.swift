@@ -8,7 +8,7 @@ import Speech
 /// keep talking while the translation is spoken, without it being heard as speech.
 final class Microphone {
     let engine = AVAudioEngine()
-    private var continuation: AsyncStream<AnalyzerInput>.Continuation?
+    private var continuation: AudioStream.Continuation?
     private var tapped = false
     private var target: AVAudioFormat?
     private var device: AudioDeviceID?
@@ -33,7 +33,7 @@ final class Microphone {
         if let configObserver { NotificationCenter.default.removeObserver(configObserver) }
     }
 
-    func start(device: AudioDeviceID?, format target: AVAudioFormat, echoCancellation: Bool) throws -> AsyncStream<AnalyzerInput> {
+    func start(device: AudioDeviceID?, format target: AVAudioFormat, echoCancellation: Bool) throws -> AudioStream {
         let input = engine.inputNode
         if input.isVoiceProcessingEnabled != echoCancellation {
             if engine.isRunning { engine.stop() }
@@ -46,7 +46,7 @@ final class Microphone {
         }
         self.target = target
         self.device = device
-        let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
+        let (stream, cont) = AudioStream.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
         buffersReceived = 0
         try installTap()
@@ -94,7 +94,7 @@ final class Microphone {
                 status.pointee = .haveData
                 return buffer
             }
-            if error == nil, out.frameLength > 0 { cont.yield(AnalyzerInput(buffer: out)) }
+            if error == nil, out.frameLength > 0 { cont.yield(out) }
         }
         tapped = true
     }

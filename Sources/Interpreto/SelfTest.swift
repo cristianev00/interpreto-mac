@@ -22,6 +22,24 @@ enum Entry {
             Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--download"), let e = SpeechEngine(rawValue: args[i + 1]) {
+            Task { @MainActor in
+                let store = ModelStore.shared
+                store.download(e)
+                var last = -1
+                while true {
+                    switch store.state(e) {
+                    case .downloading(let p):
+                        if Int(p * 10) != last { last = Int(p * 10); print("downloading \(e.rawValue): \(Int(p * 100)) %") }
+                    case .installed: print("installed:", e.rawValue); exit(0)
+                    case .failed(let m): print("failed:", m); exit(1)
+                    case .notInstalled: break
+                    }
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+            }
+            RunLoop.main.run()
+        }
         if args.contains("--reusetest") {                    // app sequence: same mic, echo off then on
             func note(_ t: String) {
                 let url = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/reusetest.txt")
@@ -37,7 +55,7 @@ enum Entry {
                 for echo in [false, true, true] {
                     speaker.use(engine: echo ? mic.engine : nil)
                     note("starting mic, echo \(echo)")
-                    let s: AsyncStream<AnalyzerInput>
+                    let s: AudioStream
                     do { s = try mic.start(device: nil, format: fmt, echoCancellation: echo) } catch { note("start failed: \(error)"); continue }
                     note("mic started")
                     let drain = Task.detached { for await _ in s {} }
@@ -59,9 +77,10 @@ enum Entry {
         }
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
-        let files = args[(i + 2)...].map { URL(fileURLWithPath: $0) }
+        let engine = args.firstIndex(of: "--engine").flatMap { SpeechEngine(rawValue: args[$0 + 1]) } ?? .apple
+        let files = args[(i + 2)...].filter { $0.hasSuffix(".wav") }.map { URL(fileURLWithPath: $0) }
         Task { @MainActor in
-            await SelfTest.run(dir, files)
+            await SelfTest.run(dir, files, engine: engine)
             exit(0)
         }
         RunLoop.main.run()
@@ -79,8 +98,9 @@ final class FedClock: @unchecked Sendable {
 
 @MainActor
 enum SelfTest {
-    static func run(_ d: Direction, _ files: [URL]) async {
-        let recognizer = Recognizer()
+    static func run(_ d: Direction, _ files: [URL], engine: SpeechEngine = .apple) async {
+        let recognizer: SpeechRecognizing = engine == .apple ? Recognizer() : ModelRecognizer(engine: engine)
+        print("engine:", engine.rawValue)
         let translator = Translator()
         let t0 = Date()
         var clipEnds: [Double] = []
@@ -89,7 +109,7 @@ enum SelfTest {
 
         do {
             try await recognizer.start(direction: d, vocabulary: [], input: { format in
-                let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream()
+                let (stream, cont) = AudioStream.makeStream()
                 Task.detached {
                     for f in files {
                         guard let file = try? AVAudioFile(forReading: f) else { continue }
@@ -129,7 +149,7 @@ enum SelfTest {
         for t in pending { await t.value }
     }
 
-    nonisolated static func feed(_ file: AVAudioFile, to target: AVAudioFormat, _ cont: AsyncStream<AnalyzerInput>.Continuation) async {
+    nonisolated static func feed(_ file: AVAudioFile, to target: AVAudioFormat, _ cont: AudioStream.Continuation) async {
         let src = file.processingFormat
         guard let conv = AVAudioConverter(from: src, to: target) else { return }
         let chunk = AVAudioFrameCount(src.sampleRate / 10)          // 100 ms, sent in real time
@@ -143,13 +163,13 @@ enum SelfTest {
                 if fed { st.pointee = .noDataNow; return nil }
                 fed = true; st.pointee = .haveData; return buf
             }
-            cont.yield(AnalyzerInput(buffer: out))
+            cont.yield(out)
             FedClock.shared.add(Double(buf.frameLength) / src.sampleRate)
             try? await Task.sleep(for: .milliseconds(100))
         }
     }
 
-    nonisolated static func feedSilence(_ seconds: Double, _ format: AVAudioFormat, _ cont: AsyncStream<AnalyzerInput>.Continuation) async {
+    nonisolated static func feedSilence(_ seconds: Double, _ format: AVAudioFormat, _ cont: AudioStream.Continuation) async {
         for _ in 0..<Int(seconds * 10) {
             let n = AVAudioFrameCount(format.sampleRate / 10)
             guard let b = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: n) else { return }
@@ -157,7 +177,7 @@ enum SelfTest {
             // Room tone, like a real microphone between sentences (not digital silence).
             if let p = b.int16ChannelData?[0] { for i in 0..<Int(n) { p[i] = Int16.random(in: -60...60) } }
             else if let p = b.floatChannelData?[0] { for i in 0..<Int(n) { p[i] = Float.random(in: -0.002...0.002) } }
-            cont.yield(AnalyzerInput(buffer: b))
+            cont.yield(b)
             FedClock.shared.add(0.1)
             try? await Task.sleep(for: .milliseconds(100))
         }
@@ -246,7 +266,7 @@ enum EchoTest {
                     let file = try AVAudioFile(forWriting: url, settings: f.settings, commonFormat: f.commonFormat, interleaved: f.isInterleaved)
                     print("saving heard audio to", url.path)
                     return AsyncStream { cont in
-                        Task.detached { for await x in live { try? file.write(from: x.buffer); cont.yield(x) }; cont.finish() }
+                        Task.detached { for await x in live { try? file.write(from: x); cont.yield(x) }; cont.finish() }
                     }
                 },
                 onPartial: { _ in }, onCommit: { _, text, s, e in print(String(format: "  heard [%.1f–%.1fs]: %@", s, e, text)) },

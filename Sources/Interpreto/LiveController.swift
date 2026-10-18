@@ -24,7 +24,35 @@ final class LiveController {
 
     let history: HistoryStore
     private let mic = Microphone()
-    private let recognizer = Recognizer()
+    private let appleRecognizer = Recognizer()
+    private var modelRecognizers: [SpeechEngine: ModelRecognizer] = [:]
+    private var recognizer: SpeechRecognizing
+    /// The speech engine actually in use (Apple if the chosen model isn't downloaded).
+    private(set) var activeEngine: SpeechEngine = .apple
+
+    /// The engine chosen in Settings for the spoken language, if its model is installed.
+    private func recognizer(for d: Direction) -> SpeechRecognizing {
+        let e = SpeechEngine.chosen(for: d)
+        guard e != .apple, ModelStore.isInstalled(e) else { activeEngine = .apple; return appleRecognizer }
+        activeEngine = e
+        if let r = modelRecognizers[e] { return r }
+        let r = ModelRecognizer(engine: e)
+        modelRecognizers[e] = r
+        return r
+    }
+
+    /// Name of the speech engine for the current direction (what the sidebar shows).
+    var engineName: String {
+        let e = SpeechEngine.chosen(for: direction)
+        let use = (e != .apple && ModelStore.shared.state(e) == .installed) ? e : .apple
+        return ["apple": "Apple", "parakeet": "Parakeet", "sensevoice": "SenseVoice"][use.rawValue]!
+    }
+
+    /// Loads the chosen model ahead of time, so pressing record starts at once.
+    func preloadEngine() {
+        guard let r = recognizer(for: direction) as? ModelRecognizer else { return }
+        Task { try? await r.prepare() }
+    }
     let translator = Translator()
     private let speaker = Speaker()
     private var started = Date()
@@ -40,6 +68,7 @@ final class LiveController {
         let d = Direction(rawValue: UserDefaults.standard.string(forKey: Pref.direction) ?? "") ?? .enToZh
         direction = d
         session = Session(direction: d)
+        recognizer = appleRecognizer
     }
 
     // MARK: listening
@@ -73,6 +102,7 @@ final class LiveController {
                     }
                 }
             }
+            recognizer = recognizer(for: direction)
             do {
                 try await recognizer.start(
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
@@ -118,6 +148,7 @@ final class LiveController {
             }
         } else {
             direction = d
+            preloadEngine()
         }
     }
 
