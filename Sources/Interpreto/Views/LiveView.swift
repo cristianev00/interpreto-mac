@@ -16,7 +16,7 @@ struct LiveView: View {
     /// Changes whenever the transcript grows: a new sentence, more translation, more live text.
     private var growth: Int {
         live.session.items.count &* 7919 &+ (live.session.items.last?.translation.count ?? 0) &* 31
-            &+ live.partial.count &* 7 &+ live.draft.count
+            &+ (live.session.items.last?.source.count ?? 0)
     }
 
     var body: some View {
@@ -29,16 +29,13 @@ struct LiveView: View {
                         ForEach(live.session.items) { u in
                             UtteranceRow(u: u, size: size, showOriginal: showOriginal,
                                          speaking: live.speakingID == u.id)
-                            if u.id != live.session.items.last?.id || !live.partial.isEmpty { Divider() }
-                        }
-                        if !live.partial.isEmpty {
-                            InProgressRow(size: size, showOriginal: showOriginal)
+                            if u.id != live.session.items.last?.id { Divider() }
                         }
                     }
                     .frame(maxWidth: 860, alignment: .leading)
                     .padding(.horizontal, 40)
                     .padding(.top, 20)
-                    .padding(.bottom, 130)
+                    .padding(.bottom, 240)
                     .frame(maxWidth: .infinity)
                 }
                 .scrollPosition($position)
@@ -55,7 +52,8 @@ struct LiveView: View {
                 }
             }
 
-            VStack(spacing: 10) {
+            VStack(spacing: 12) {
+                LiveNow(size: size, showOriginal: showOriginal)
                 if !following && !isEmpty {
                     Button {
                         following = true
@@ -162,29 +160,50 @@ private struct UtteranceRow: View {
     }
 }
 
-/// The sentence being spoken right now (last line of the transcript), with its live translation.
-private struct InProgressRow: View {
+/// The words being spoken right now, floating above the record button, with their live
+/// translation. When the sentence ends it moves into the list. If the recognizer's live text is
+/// briefly empty without a sentence ending, the last words stay up instead of blinking out.
+private struct LiveNow: View {
     @Environment(LiveController.self) private var live
     let size: Double
     let showOriginal: Bool
+    @State private var shownSource = ""
+    @State private var shownDraft = ""
+    @State private var clearTask: Task<Void, Never>?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            if showOriginal {
-                Text(live.partial).font(.system(size: size * 0.6)).foregroundStyle(.secondary)
+        VStack(spacing: 4) {
+            if showOriginal, !shownSource.isEmpty {
+                Text(shownSource).font(.system(size: size * 0.6)).foregroundStyle(.secondary)
             }
-            Group {
-                if live.draft.isEmpty {
-                    Text("…").foregroundStyle(.tertiary)
-                } else {
-                    Text(live.draft).foregroundStyle(.tint.opacity(0.75))
+            if !shownDraft.isEmpty {
+                Text(shownDraft).font(.system(size: size, weight: .medium)).foregroundStyle(.tint.opacity(0.85))
+            }
+        }
+        .multilineTextAlignment(.center)
+        .lineLimit(3)
+        .frame(maxWidth: 860)
+        .animation(.easeOut(duration: 0.15), value: shownDraft)
+        .onChange(of: live.partial) { _, text in
+            if !text.isEmpty {
+                clearTask?.cancel()
+                shownSource = text
+                shownDraft = live.draft
+            } else {
+                // Sentence finished (it's now in the list): clear at once. Otherwise hold briefly.
+                let finished = live.session.items.last.map { $0.source.hasSuffix(shownSource.suffix(6)) } ?? false
+                clearTask?.cancel()
+                clearTask = Task {
+                    if !finished { try? await Task.sleep(for: .seconds(1.2)) }
+                    guard !Task.isCancelled, live.partial.isEmpty else { return }
+                    shownSource = ""; shownDraft = ""
                 }
             }
-            .font(.system(size: size, weight: .medium))
         }
-        .padding(.vertical, 14)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .animation(.easeOut(duration: 0.15), value: live.draft)
+        .onChange(of: live.draft) { _, d in if !d.isEmpty || live.partial.isEmpty { shownDraft = d.isEmpty ? shownDraft : d } }
+        .onChange(of: live.session.items.count) {
+            if live.partial.isEmpty { clearTask?.cancel(); shownSource = ""; shownDraft = "" }
+        }
     }
 }
 
