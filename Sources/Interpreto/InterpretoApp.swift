@@ -50,6 +50,15 @@ struct InterpretoApp: App {
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+
+    /// Release the translation model from the GPU before quitting (llama.cpp requires it).
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task {
+            await HYMT2.shared.unload()
+            await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
+    }
 }
 
 enum Pane: String, CaseIterable, Identifiable, Hashable {

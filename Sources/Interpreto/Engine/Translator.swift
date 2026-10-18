@@ -15,13 +15,27 @@ final class Translator {
         return s
     }
 
-    func translate(_ text: String, _ d: Direction, glossary: Glossary) async throws -> String {
+    /// - context: the previous sentences (used by HY-MT2 for consistent wording)
+    /// - quick: the live preview while someone is still speaking; always Apple's, the fastest
+    func translate(_ text: String, _ d: Direction, glossary: Glossary,
+                   context: [String] = [], quick: Bool = false) async throws -> String {
+        if d == .enToZh, !quick, Self.usesHYMT2 {
+            let terms = glossary.terms(for: d).filter { text.range(of: $0.0, options: .caseInsensitive) != nil }
+            if let out = try? await HYMT2.shared.translate(text, d, context: context, terms: terms), !out.isEmpty {
+                return tidy(out.applyingTransform(StringTransform("Hant-Hans"), reverse: false) ?? out)
+            }
+        }
         let input = Self.applyGlossary(text, terms: glossary.terms(for: d))
         let response = try await session(d).translate(input)
         var out = response.targetText
         // Apple's translator occasionally answers in Traditional characters; keep Simplified.
         if d == .enToZh { out = out.applyingTransform(StringTransform("Hant-Hans"), reverse: false) ?? out }
         return tidy(out)
+    }
+
+    /// English → Chinese with HY-MT2, if chosen in Settings and downloaded.
+    static var usesHYMT2: Bool {
+        UserDefaults.standard.string(forKey: Pref.translatorZH) == "hymt2" && HYMT2.isInstalled
     }
 
     static func applyGlossary(_ text: String, terms: [(String, String)]) -> AttributedString {

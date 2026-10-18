@@ -22,6 +22,27 @@ enum Entry {
             Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--hymt") {           // --hymt en|zh lines.txt out.json
+            Task {
+                let d: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
+                let lines = (try? String(contentsOfFile: args[i + 2], encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
+                let t0 = Date()
+                try? await HYMT2.shared.load()
+                print(String(format: "loaded in %.2fs", Date().timeIntervalSince(t0)))
+                var outs: [[String: Any]] = []
+                for l in lines {
+                    let t = Date()
+                    let tr = (try? await HYMT2.shared.translate(l, d, context: [], terms: [])) ?? "<error>"
+                    outs.append(["text": tr, "secs": Date().timeIntervalSince(t)])
+                }
+                try? JSONSerialization.data(withJSONObject: ["swift-hymt2": outs]).write(to: URL(fileURLWithPath: args[i + 3]))
+                let secs = outs.compactMap { $0["secs"] as? Double }.sorted()
+                print(String(format: "median %.2fs", secs[secs.count / 2]), outs.prefix(2).map { $0["text"]! })
+                await HYMT2.shared.unload()          // llama.cpp must free the GPU before exit
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         if let i = args.firstIndex(of: "--download"), let e = SpeechEngine(rawValue: args[i + 1]) {
             Task { @MainActor in
                 let store = ModelStore.shared
@@ -78,9 +99,11 @@ enum Entry {
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
         let engine = args.firstIndex(of: "--engine").flatMap { SpeechEngine(rawValue: args[$0 + 1]) } ?? .apple
+        if let t = args.firstIndex(of: "--translator") { UserDefaults.standard.set(args[t + 1], forKey: Pref.translatorZH) }
         let files = args[(i + 2)...].filter { $0.hasSuffix(".wav") }.map { URL(fileURLWithPath: $0) }
         Task { @MainActor in
             await SelfTest.run(dir, files, engine: engine)
+            await HYMT2.shared.unload()
             exit(0)
         }
         RunLoop.main.run()

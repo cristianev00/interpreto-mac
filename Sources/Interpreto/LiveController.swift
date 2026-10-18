@@ -223,7 +223,7 @@ final class LiveController {
     private func runDraft(_ text: String) {
         let d = direction
         draftTask = Task {
-            let t = try? await translator.translate(text, d, glossary: glossary)
+            let t = try? await translator.translate(text, d, glossary: glossary, quick: true)
             if !partial.isEmpty, let t { draft = t }
             draftTask = nil
             if let next = draftPending { draftPending = nil; if !partial.isEmpty { runDraft(next) } }
@@ -239,7 +239,7 @@ final class LiveController {
         let d = direction
         Task {
             let t0 = Date()
-            let tr = await translate(text, d)
+            let tr = await translate(text, d, before: id)
             lastDelay = Date().timeIntervalSince(t0)
             update(id) { $0.translation = tr; $0.isTranslating = false }
             if defaults.bool(forKey: Pref.speak), !tr.isEmpty {
@@ -260,14 +260,17 @@ final class LiveController {
         update(id) { $0.source = text }
         let d = direction
         Task {
-            let tr = await translate(text, d)
+            let tr = await translate(text, d, before: id)
             update(id) { $0.translation = tr; $0.isTranslating = false }
             scheduleSave()
         }
     }
 
-    private func translate(_ text: String, _ d: Direction) async -> String {
-        do { return try await translator.translate(text, d, glossary: glossary) }
+    /// Translates a sentence, giving the translator the two sentences before it as context.
+    private func translate(_ text: String, _ d: Direction, before id: UUID) async -> String {
+        let i = session.items.firstIndex { $0.id == id } ?? session.items.count
+        let context = session.items[..<i].suffix(2).map(\.source)
+        do { return try await translator.translate(text, d, glossary: glossary, context: Array(context)) }
         catch { message = "Translation failed: \(error.localizedDescription)"; return "" }
     }
 

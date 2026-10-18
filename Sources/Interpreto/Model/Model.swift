@@ -81,6 +81,7 @@ enum Pref {
     static let glossary = "glossary"
     static let engineEN = "engineEN"      // speech engine when English is spoken
     static let engineZH = "engineZH"      // speech engine when Chinese is spoken
+    static let translatorZH = "translatorZH"  // English → Chinese translator: "apple" or "hymt2"
 
     static func register() {
         UserDefaults.standard.register(defaults: [

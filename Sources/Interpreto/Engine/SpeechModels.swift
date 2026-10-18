@@ -43,6 +43,8 @@ final class ModelStore {
 
     enum State: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
     private(set) var states: [SpeechEngine: State] = [:]
+    /// The optional English → Chinese translation model (HY-MT2).
+    private(set) var hymt2: State = .notInstalled
 
     nonisolated static let folder = URL.applicationSupportDirectory.appending(path: "Interpreto/Models", directoryHint: .isDirectory)
     nonisolated static var parakeetFolder: URL { folder.appending(path: "parakeet", directoryHint: .isDirectory) }
@@ -55,6 +57,7 @@ final class ModelStore {
     func state(_ e: SpeechEngine) -> State { e == .apple ? .installed : states[e] ?? .notInstalled }
 
     func refresh() {
+        if case .downloading = hymt2 {} else { hymt2 = HYMT2.isInstalled ? .installed : .notInstalled }
         for e in [SpeechEngine.parakeet, .sensevoice] {
             if case .downloading = states[e] { continue }
             states[e] = Self.isInstalled(e) ? .installed : .notInstalled
@@ -100,6 +103,43 @@ final class ModelStore {
         for d in dirs where FileManager.default.fileExists(atPath: d.path) {
             try? FileManager.default.trashItem(at: d, resultingItemURL: nil)
         }
+        refresh()
+    }
+
+    func downloadHYMT2() {
+        if case .downloading = hymt2 { return }
+        hymt2 = .downloading(0)
+        Task {
+            do {
+                try FileManager.default.createDirectory(at: HYMT2.folder, withIntermediateDirectories: true)
+                // Hugging Face (or its mirror), then ModelScope (works in mainland China).
+                let sources = ["\(Self.hfBase)/tencent/Hy-MT2-1.8B-GGUF/resolve/main/\(HYMT2.fileName)",
+                               "https://modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/\(HYMT2.fileName)"]
+                await Self.chooseMirror()
+                var lastError: Error = URLError(.cannotConnectToHost)
+                for source in sources {
+                    do {
+                        let tmp = try await Self.fetch(URL(string: source)!) { p in
+                            Task { @MainActor in ModelStore.shared.hymt2 = .downloading(p) }
+                        }
+                        let magic = try FileHandle(forReadingFrom: tmp).read(upToCount: 4)
+                        guard magic == Data("GGUF".utf8) else { throw URLError(.cannotDecodeContentData) }
+                        try? FileManager.default.removeItem(at: HYMT2.modelURL)
+                        try FileManager.default.moveItem(at: tmp, to: HYMT2.modelURL)
+                        hymt2 = .installed
+                        return
+                    } catch { lastError = error }
+                }
+                throw lastError
+            } catch {
+                hymt2 = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    func removeHYMT2() {
+        Task { await HYMT2.shared.unload() }
+        try? FileManager.default.trashItem(at: HYMT2.folder, resultingItemURL: nil)
         refresh()
     }
 

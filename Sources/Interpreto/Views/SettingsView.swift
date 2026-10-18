@@ -144,6 +144,7 @@ private struct EngineSettings: View {
                     note: "Parakeet made about 30% fewer mistakes than Apple on English spoken with 22 different accents, at the same speed.")
             section("When Chinese is spoken", direction: .zhToEn, selection: $chinese,
                     note: "SenseVoice made about 25% fewer mistakes than Apple on Mandarin, and is trained on many regional accents.")
+            translationSection
             Section {
             } footer: {
                 Text("Models run entirely on this Mac. If a model isn’t downloaded yet, Apple’s engine is used.")
@@ -171,6 +172,42 @@ private struct EngineSettings: View {
             Text(title)
         } footer: {
             Text(note).font(.caption).foregroundStyle(.secondary)
+        }
+    }
+
+    @AppStorage(Pref.translatorZH) private var translatorZH = "apple"
+
+    private var translationSection: some View {
+        Section {
+            Picker("Translator", selection: $translatorZH) {
+                Text("Apple (built in)").tag("apple")
+                Text("HY-MT2 — more natural Chinese").tag("hymt2")
+            }
+            .onChange(of: translatorZH) { _, value in
+                if value == "hymt2", store.hymt2 != .installed { store.downloadHYMT2() }
+                if value == "apple" { Task { await HYMT2.shared.unload() } }     // free its ~2 GB
+            }
+            LabeledContent("HY-MT2 model") {
+                switch store.hymt2 {
+                case .installed:
+                    HStack {
+                        Label("Downloaded", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
+                        Button("Remove") { store.removeHYMT2() }.buttonStyle(.borderless)
+                    }
+                case .downloading(let p): ProgressView(value: p).frame(width: 160)
+                case .notInstalled: Button("Download (about 1.9 GB)") { store.downloadHYMT2() }
+                case .failed(let message):
+                    HStack {
+                        Text(message).foregroundStyle(.red).lineLimit(1)
+                        Button("Try Again") { store.downloadHYMT2() }
+                    }
+                }
+            }
+        } header: {
+            Text("Translation into Chinese")
+        } footer: {
+            Text("In a blind comparison, HY-MT2 gave the better Chinese translation 7 times out of 10 (about 0.4 s per sentence; the live preview while speaking stays instant). For Chinese → English, Apple’s translator was the most reliable.")
+                .font(.caption).foregroundStyle(.secondary)
         }
     }
 

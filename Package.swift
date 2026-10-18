@@ -17,11 +17,17 @@ let package = Package(
     ],
     targets: [
         .systemLibrary(name: "SherpaOnnxC", path: "Vendor/SherpaOnnxC"),
+        // llama.cpp (MIT) for the HY-MT2 translation model, Metal-accelerated.
+        .binaryTarget(
+            name: "llama",
+            url: "https://github.com/ggml-org/llama.cpp/releases/download/b11381/llama-b11381-xcframework.zip",
+            checksum: "0d41c207c7c0ad736d0b8662add59872c63fa416f10eb087c7e62e012295416f"),
         .executableTarget(
             name: "Interpreto",
             dependencies: [
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 "SherpaOnnxC",
+                "llama",
             ],
             path: "Sources/Interpreto",
             swiftSettings: [.swiftLanguageMode(.v5)],
