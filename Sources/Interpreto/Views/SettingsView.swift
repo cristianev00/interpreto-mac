@@ -242,7 +242,7 @@ private struct EngineSettings: View {
 
     @ViewBuilder
     private func modelRow(_ e: SpeechEngine) -> some View {
-        LabeledContent(e == .parakeet ? "Parakeet model" : "SenseVoice model") {
+        LabeledContent(e.modelName) {
             switch store.state(e) {
             case .installed:
                 HStack {

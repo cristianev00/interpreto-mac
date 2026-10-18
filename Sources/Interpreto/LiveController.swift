@@ -65,7 +65,7 @@ final class LiveController {
     var engineName: String {
         let e = SpeechEngine.chosen(for: direction)
         let use = (e != .apple && ModelStore.shared.state(e) == .installed) ? e : .apple
-        return ["apple": "Apple", "parakeet": "Parakeet", "sensevoice": "SenseVoice"][use.rawValue]!
+        return ["apple": "Apple", "parakeet": "Parakeet", "sensevoice": "SenseVoice", "funasr": "Fun-ASR-Nano"][use.rawValue]!
     }
 
     /// Loads the chosen model ahead of time, so pressing record starts at once.

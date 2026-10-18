@@ -30,6 +30,8 @@ final class ModelRecognizer: SpeechRecognizing {
 
     let engine: SpeechEngine
     private var model: UtteranceModel?
+    /// Optional second pass for finished sentences (more accurate, slower than the live model).
+    private var finalModel: UtteranceModel?
     private var feedTask: Task<Void, Never>?
 
     private var samples: [Float] = []      // the utterance so far (from just before speech began)
@@ -52,6 +54,9 @@ final class ModelRecognizer: SpeechRecognizing {
         switch engine {
         case .parakeet: model = try await ParakeetModel.load()
         case .sensevoice: model = try await Task.detached { try SenseVoiceModel.load() }.value
+        case .funasr:
+            model = try await Task.detached { try SenseVoiceModel.load() }.value
+            finalModel = try await Task.detached { try FunASRNanoModel.load() }.value
         case .apple: break
         }
     }
@@ -86,7 +91,7 @@ final class ModelRecognizer: SpeechRecognizing {
     }
 
     /// Frees the model's memory; it reloads on the next start.
-    func unload() { model = nil }
+    func unload() { model = nil; finalModel = nil }
 
     func stop() async {
         feedTask?.cancel()
@@ -149,38 +154,68 @@ final class ModelRecognizer: SpeechRecognizing {
         trace(String(format: "speech starts at %.2f", t))
     }
 
+    /// Sentence work runs one step at a time, in order: a slow second pass must not let a later
+    /// pause commit the same audio again.
+    private var queue: Task<Void, Never>?
+
+    private func serially(_ work: @escaping @MainActor () async -> Void) async {
+        let previous = queue
+        let task = Task { @MainActor in
+            await previous?.value
+            await work()
+        }
+        queue = task
+        await task.value
+    }
+
     private func paused(at speechEnd: Double, long: Bool) async {
+        await serially { [weak self] in await self?.handlePause(at: speechEnd, long: long) }
+    }
+
+    private func handlePause(at speechEnd: Double, long: Bool) async {
         Diagnostics.event(String(format: "pause (%@): speech ended %.2fs", long ? "long" : "short", speechEnd))
         trace(String(format: "pause (%@) at %.2f, speaking %@, utterance from %.2f", long ? "long" : "short", speechEnd, speaking ? "yes" : "no", startTime))
         guard speaking else { return }
-        if long { await commit(upTo: speechEnd + 0.25); return }
+        if long { await commitNow(upTo: speechEnd + 0.25); return }
         // Short pause: commit only a finished sentence.
         guard let model else { return }
         let cut = min(samples.count, Int((speechEnd + 0.25 - startTime) * Self.rate))
         guard cut > 0 else { return }
         let text = Self.clean((try? await model.transcribe(Array(samples[..<cut]))) ?? "")
         trace("short-pause text: \(text)")
-        if Recognizer.endsSentence(text) { await commit(upTo: speechEnd + 0.25, text: text) }
+        if Recognizer.endsSentence(text) { await commitNow(upTo: speechEnd + 0.25, liveText: text) }
     }
 
-    /// Commits the utterance up to audio time `end` as a sentence (transcribing it unless `text`
-    /// is given) and keeps any audio after it for the next sentence.
-    private func commit(upTo end: Double, text known: String? = nil) async {
+    private func commit(upTo end: Double) async {
+        await serially { [weak self] in await self?.commitNow(upTo: end) }
+    }
+
+    /// Commits the utterance up to audio time `end` as a sentence and keeps any audio after it for
+    /// the next sentence. The audio is taken first, then transcribed. With a second-pass model the
+    /// sentence is transcribed again by it, unless that clearly dropped words the live model heard.
+    private func commitNow(upTo end: Double, liveText: String? = nil) async {
         guard speaking, let model else { return }
         let cut = max(0, min(samples.count, Int((end - startTime) * Self.rate)))
         let head = Array(samples[..<cut])
-        let text: String
-        if let known { text = known } else {
-            text = Self.clean((try? await model.transcribe(head)) ?? "")
-        }
         let start = startTime
         samples.removeFirst(min(cut, samples.count))
         startTime = start + Double(cut) / Self.rate
         speaking = false            // the next "speech started" event begins the next sentence
-        trace(String(format: "commit %.2f–%.2f, %d samples left, speaking %@: %@", start, end, samples.count, speaking ? "yes" : "no", text))
         lastPartial = ""
         lastPartialAt = time
         onPartial("")
+
+        var text = liveText ?? ""
+        if let finalModel {
+            if liveText == nil { text = Self.clean((try? await model.transcribe(head)) ?? "") }
+            let refined = Self.clean((try? await finalModel.transcribe(head)) ?? "")
+            let kept = Recognizer.normalized(refined).count, heard = Recognizer.normalized(text).count
+            if !refined.isEmpty, Double(kept) >= 0.7 * Double(heard) { text = refined }
+            else { trace("second pass dropped words; keeping: \(text)") }
+        } else if liveText == nil {
+            text = Self.clean((try? await model.transcribe(head)) ?? "")
+        }
+        trace(String(format: "commit %.2f–%.2f, %d samples left: %@", start, end, samples.count, text))
         if !text.isEmpty {
             Diagnostics.event(String(format: "SENTENCE (%@) %.2f–%.2fs: %@", engine.rawValue, start, end, text))
             onCommit(UUID(), text, start, end)
