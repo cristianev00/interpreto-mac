@@ -27,21 +27,28 @@ final class Microphone {
         }
         AudioDevices.route(input, to: device)
         let source = input.outputFormat(forBus: 0)
-        guard source.sampleRate > 0, let converter = AVAudioConverter(from: source, to: target) else {
+        // Microphones (and voice processing, which reports 9 identical channels) can be
+        // multichannel: take the first channel as mono, then convert to the model's format.
+        guard source.sampleRate > 0,
+              let mono = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: source.sampleRate, channels: 1, interleaved: false),
+              let converter = AVAudioConverter(from: mono, to: target) else {
             throw NSError(domain: "Interpreto", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "This microphone can’t be used. Choose another one in Settings."])
         }
         let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream(bufferingPolicy: .unbounded)
         continuation = cont
 
-        input.installTap(onBus: 0, bufferSize: 2048, format: source) { [weak self] buffer, _ in
-            guard let self else { return }
-            if let ch = buffer.floatChannelData?[0] {
-                var sum: Float = 0
-                for i in 0..<Int(buffer.frameLength) { sum += ch[i] * ch[i] }
-                self.onLevel?(sqrt(sum / Float(max(1, buffer.frameLength))))
-            }
-            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * target.sampleRate / source.sampleRate) + 64
+        input.installTap(onBus: 0, bufferSize: 2048, format: source) { [weak self] raw, _ in
+            guard let self, let ch = raw.floatChannelData?[0],
+                  let buffer = AVAudioPCMBuffer(pcmFormat: mono, frameCapacity: raw.frameLength),
+                  let dst = buffer.floatChannelData?[0] else { return }
+            let n = Int(raw.frameLength)
+            buffer.frameLength = raw.frameLength
+            dst.update(from: ch, count: n)
+            var sum: Float = 0
+            for i in 0..<n { sum += ch[i] * ch[i] }
+            self.onLevel?(sqrt(sum / Float(max(1, n))))
+            let capacity = AVAudioFrameCount(Double(n) * target.sampleRate / source.sampleRate) + 64
             guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
             var fed = false
             var error: NSError?

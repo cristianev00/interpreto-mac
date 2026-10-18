@@ -22,6 +22,10 @@ enum Entry {
             Task { @MainActor in await VoiceTest.run(language: args[i + 1], text: args[i + 2], folder: args[i + 3]); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--echotest") {       // --echotest on|off seconds
+            Task { @MainActor in await EchoTest.run(echo: args[i + 1] == "on", seconds: Double(args[i + 2]) ?? 20); exit(0) }
+            RunLoop.main.run()
+        }
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
         let files = args[(i + 2)...].map { URL(fileURLWithPath: $0) }
@@ -186,5 +190,36 @@ enum VoiceTest {
             if (try? engine.renderOffline(4096, to: buf)) == .success { try? new.write(from: buf) } else { break }
         }
         print("wrote old.caf and new.caf")
+    }
+}
+
+
+/// Real-room test: listens to the microphone (English) while Interpreto keeps speaking Chinese
+/// on the speakers. With echo cancellation, only the person in the room should be transcribed.
+@MainActor
+enum EchoTest {
+    static func run(echo: Bool, seconds: Double) async {
+        let mic = Microphone(), recognizer = Recognizer(), speaker = Speaker()
+        speaker.use(engine: echo ? mic.engine : nil)
+        print("echo cancellation:", echo)
+        do {
+            try await recognizer.start(direction: .enToZh, vocabulary: [],
+                input: { f in try mic.start(device: nil, format: f, echoCancellation: echo) },
+                onPartial: { _ in }, onCommit: { _, text, _, _ in print("  heard:", text) },
+                onRevise: { _, text in print("  revised:", text) }, onError: { print("error", $0) })
+        } catch { print("start failed", error); return }
+        let lines = ["今天我们学习C语言中的指针。", "指针是一个存储地址的变量。", "请大家打开课本第三十页。", "我们来看第一个例子。"]
+        let t0 = Date()
+        var k = 0
+        while Date().timeIntervalSince(t0) < seconds {
+            if !speaker.isSpeaking {
+                speaker.speak(lines[k % lines.count], language: "zh-CN", voiceID: nil, outputUID: nil, onStart: {})
+                k += 1
+            }
+            try? await Task.sleep(for: .milliseconds(300))
+        }
+        mic.stop()
+        await recognizer.stop()
+        print("Interpreto spoke \(k) Chinese sentences")
     }
 }
