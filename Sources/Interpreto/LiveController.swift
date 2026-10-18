@@ -112,6 +112,7 @@ final class LiveController {
             // echo cancellation removes it from what the mic hears, and the speaker can keep
             // talking. With headphones or a virtual cable chosen, there's no echo to cancel.
             let echo = defaults.bool(forKey: Pref.speak) && (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty
+            mic.freshEngine()
             speaker.use(engine: echo ? mic.engine : nil)
             var lastLevelLog = Date.distantPast
             mic.onLevel = { [weak self] v in
@@ -129,7 +130,7 @@ final class LiveController {
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
                     input: { [mic] format in
                         Diagnostics.event("listening: \(self.direction.label), echo cancellation \(echo), recognizer format \(format)")
-                        return Diagnostics.tap(try mic.start(device: device, format: format, echoCancellation: echo), format: format)
+                        return Diagnostics.tap(try mic.start(uid: self.defaults.string(forKey: Pref.micUID), format: format, echoCancellation: echo), format: format)
                     },
                     onPartial: { [weak self] in self?.partialChanged($0) },
                     onCommit: { [weak self] id, text, start, end in self?.committed(id, text, start, end) },
@@ -138,6 +139,7 @@ final class LiveController {
                 isListening = true
                 listeningSince = Date()
             } catch {
+                Diagnostics.event("start failed: \(error) — \((error as NSError).domain) \((error as NSError).code)")
                 mic.stop()
                 await recognizer.cancel()
                 message = error.localizedDescription

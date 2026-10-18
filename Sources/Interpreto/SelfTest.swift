@@ -127,7 +127,7 @@ enum Entry {
                     speaker.use(engine: echo ? mic.engine : nil)
                     note("starting mic, echo \(echo)")
                     let s: AudioStream
-                    do { s = try mic.start(device: nil, format: fmt, echoCancellation: echo) } catch { note("start failed: \(error)"); continue }
+                    do { s = try mic.start(uid: nil, format: fmt, echoCancellation: echo) } catch { note("start failed: \(error)"); continue }
                     note("mic started")
                     let drain = Task.detached { for await _ in s {} }
                     try? await Task.sleep(for: .seconds(2))
@@ -333,7 +333,7 @@ enum EchoTest {
         do {
             try await recognizer.start(direction: .enToZh, vocabulary: [],
                 input: { f in
-                    let live = try mic.start(device: nil, format: f, echoCancellation: echo)
+                    let live = try mic.start(uid: nil, format: f, echoCancellation: echo)
                     // Also save exactly what the recognizer hears.
                     let url = URL(fileURLWithPath: NSTemporaryDirectory() + "interpreto-heard-\(echo ? "on" : "off").caf")
                     let file = try AVAudioFile(forWriting: url, settings: f.settings, commonFormat: f.commonFormat, interleaved: f.isInterleaved)
