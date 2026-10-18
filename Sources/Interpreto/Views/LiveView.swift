@@ -8,6 +8,17 @@ struct LiveView: View {
 
     private var isEmpty: Bool { live.session.items.isEmpty && live.partial.isEmpty }
 
+    @State private var position = ScrollPosition(edge: .bottom)
+    @State private var atBottom = true
+    /// Follow new text to the bottom, unless the user has scrolled up to reread.
+    @State private var following = true
+
+    /// Changes whenever the transcript grows: a new sentence, more translation, more live text.
+    private var growth: Int {
+        live.session.items.count &* 7919 &+ (live.session.items.last?.translation.count ?? 0) &* 31
+            &+ live.partial.count &* 7 &+ live.draft.count
+    }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             if isEmpty {
@@ -18,22 +29,46 @@ struct LiveView: View {
                         ForEach(live.session.items) { u in
                             UtteranceRow(u: u, size: size, showOriginal: showOriginal,
                                          speaking: live.speakingID == u.id)
-                            if u.id != live.session.items.last?.id { Divider() }
+                            if u.id != live.session.items.last?.id || !live.partial.isEmpty { Divider() }
+                        }
+                        if !live.partial.isEmpty {
+                            InProgressRow(size: size, showOriginal: showOriginal)
                         }
                     }
                     .frame(maxWidth: 860, alignment: .leading)
                     .padding(.horizontal, 40)
                     .padding(.top, 20)
-                    .padding(.bottom, 240)
+                    .padding(.bottom, 130)
                     .frame(maxWidth: .infinity)
                 }
-                .defaultScrollAnchor(.bottom, for: .sizeChanges)
+                .scrollPosition($position)
+                .onScrollGeometryChange(for: Bool.self) { g in
+                    g.contentOffset.y + g.containerSize.height >= g.contentSize.height - 80
+                } action: { _, bottom in atBottom = bottom }
+                .onScrollPhaseChange { old, new in
+                    // Only the user's own scrolling changes whether we follow.
+                    if new == .idle, old == .interacting || old == .decelerating { following = atBottom }
+                }
+                .onChange(of: growth) {
+                    guard following else { return }
+                    withAnimation(.easeOut(duration: 0.18)) { position.scrollTo(edge: .bottom) }
+                }
             }
 
-            VStack(spacing: 14) {
-                LiveNow(size: size, showOriginal: showOriginal)
+            VStack(spacing: 10) {
+                if !following && !isEmpty {
+                    Button {
+                        following = true
+                        withAnimation(.easeOut(duration: 0.25)) { position.scrollTo(edge: .bottom) }
+                    } label: {
+                        Label("Jump to Latest", systemImage: "arrow.down")
+                    }
+                    .buttonStyle(.glass)
+                    .transition(.opacity.combined(with: .scale(scale: 0.9)))
+                }
                 RecordCapsule()
             }
+            .animation(.easeOut(duration: 0.2), value: following)
             .padding(.horizontal, 24)
             .padding(.bottom, 22)
             .padding(.top, 36)
@@ -44,6 +79,7 @@ struct LiveView: View {
             }
         }
         .background(Color(nsColor: .textBackgroundColor))
+        .onChange(of: live.session.id) { following = true }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Toggle(isOn: $speak) {
@@ -126,26 +162,29 @@ private struct UtteranceRow: View {
     }
 }
 
-/// The sentence being spoken right now, with its live translation.
-private struct LiveNow: View {
+/// The sentence being spoken right now (last line of the transcript), with its live translation.
+private struct InProgressRow: View {
     @Environment(LiveController.self) private var live
     let size: Double
     let showOriginal: Bool
 
     var body: some View {
-        if !live.partial.isEmpty {
-            VStack(spacing: 4) {
-                if showOriginal {
-                    Text(live.partial).font(.system(size: size * 0.6)).foregroundStyle(.secondary)
-                }
-                if !live.draft.isEmpty {
-                    Text(live.draft).font(.system(size: size, weight: .medium)).foregroundStyle(.tint.opacity(0.8))
+        VStack(alignment: .leading, spacing: 5) {
+            if showOriginal {
+                Text(live.partial).font(.system(size: size * 0.6)).foregroundStyle(.secondary)
+            }
+            Group {
+                if live.draft.isEmpty {
+                    Text("…").foregroundStyle(.tertiary)
+                } else {
+                    Text(live.draft).foregroundStyle(.tint.opacity(0.75))
                 }
             }
-            .multilineTextAlignment(.center)
-            .frame(maxWidth: 860)
-            .animation(.easeOut(duration: 0.15), value: live.draft)
+            .font(.system(size: size, weight: .medium))
         }
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(.easeOut(duration: 0.15), value: live.draft)
     }
 }
 

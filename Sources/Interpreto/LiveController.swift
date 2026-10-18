@@ -179,6 +179,7 @@ final class LiveController {
     private var now: Double { Date().timeIntervalSince(started) }
 
     private func partialChanged(_ text: String) {
+        if text != partial { Diagnostics.event("live text: \(text)") }
         partial = text
         if text.isEmpty { draft = ""; return }
         guard defaults.bool(forKey: Pref.livePreview) else { draft = ""; return }
