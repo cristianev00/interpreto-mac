@@ -16,6 +16,12 @@ final class Microphone {
     /// Buffers received since the last start (to detect a microphone that delivers nothing).
     private(set) var buffersReceived = 0
 
+    /// When the translation plays on loudspeakers without echo cancellation, hand the recognizer
+    /// silence while it plays, so the microphone can't pick up the voice and translate it again.
+    var muteWhileSpeaking = false
+    /// True when Apple's echo cancellation is active (then muting isn't needed).
+    private(set) var echoCancelled = false
+
     /// Called on the audio thread with the input level (RMS, 0…1).
     var onLevel: ((Float) -> Void)?
 
@@ -52,6 +58,7 @@ final class Microphone {
     ///   microphone and the speakers run at different rates, e.g. AirPods' mic + MacBook speakers).
     func start(uid: String?, format target: AVAudioFormat, echoCancellation: Bool) throws -> AudioStream {
         self.target = target
+        echoCancelled = false
         if !echoCancellation { return try startCapture(uid: uid) }
         let device = AudioDevices.id(forUID: uid, input: true)
         let input = engine.inputNode
@@ -99,6 +106,7 @@ final class Microphone {
                 installTap()
             }
         }
+        echoCancelled = input.isVoiceProcessingEnabled
         Diagnostics.event("mic: engine started, running \(engine.isRunning)")
         return stream
     }
@@ -136,7 +144,11 @@ final class Microphone {
         let n = Int(raw.frameLength)
         buffersReceived += 1
         buffer.frameLength = raw.frameLength
-        dst.update(from: ch, count: n)
+        if muteWhileSpeaking, !echoCancelled, PlaybackState.shared.isActive {
+            dst.update(repeating: 0, count: n)            // the voice is playing: hear nothing
+        } else {
+            dst.update(from: ch, count: n)
+        }
         var sum: Float = 0
         for i in 0..<n { sum += ch[i] * ch[i] }
         onLevel?(sqrt(sum / Float(max(1, n))))

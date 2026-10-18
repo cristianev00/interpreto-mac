@@ -111,7 +111,18 @@ final class LiveController {
             // Voice on the normal speakers: play it through the microphone's engine so Apple's
             // echo cancellation removes it from what the mic hears, and the speaker can keep
             // talking. With headphones or a virtual cable chosen, there's no echo to cancel.
-            let echo = defaults.bool(forKey: Pref.speak) && (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty
+            // Protect against the microphone hearing the spoken translation when it plays on
+            // loudspeakers and the microphone isn't a headset. Apple's echo cancellation works with
+            // the system's default devices; otherwise the microphone is muted while the voice plays.
+            let chosenMic = (defaults.string(forKey: Pref.micUID) ?? "").isEmpty ? nil : defaults.string(forKey: Pref.micUID)
+            let chosenOut = (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty ? nil : defaults.string(forKey: Pref.outputUID)
+            let defaultIn = AudioDevices.defaultUID(input: true), defaultOut = AudioDevices.defaultUID(input: false)
+            let micUID = chosenMic ?? defaultIn, outUID = chosenOut ?? defaultOut
+            let needsProtection = defaults.bool(forKey: Pref.speak) && AudioDevices.isLoudspeaker(outUID)
+                && !AudioDevices.isHeadset(micUID)
+            let echo = needsProtection && micUID == defaultIn && outUID == defaultOut
+            mic.muteWhileSpeaking = needsProtection
+            Diagnostics.event("devices: mic \(micUID ?? "-"), output \(outUID ?? "-"); protection \(needsProtection), echo cancellation \(echo)")
             mic.freshEngine()
             speaker.use(engine: echo ? mic.engine : nil)
             var lastLevelLog = Date.distantPast

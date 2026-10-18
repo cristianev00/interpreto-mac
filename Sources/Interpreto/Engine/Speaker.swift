@@ -93,6 +93,7 @@ final class Speaker {
     }
 
     func stop() {
+        PlaybackState.shared.stopped()
         generation += 1
         neuralChain?.cancel()
         neuralChain = nil
@@ -186,6 +187,7 @@ final class Speaker {
         }
         let seconds = Double(pcm.frameLength) / f.sampleRate
         backlog += seconds
+        PlaybackState.shared.playing(remaining: backlog)
         player.scheduleBuffer(pcm) { [weak self] in
             DispatchQueue.main.async { self.map { $0.backlog = max(0, $0.backlog - seconds) } }
         }
