@@ -9,6 +9,15 @@ import SwiftUI
 enum Entry {
     static func main() {
         let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--translate") {       // --translate en|zh "text" ["term = 术语\n…"]
+            let d: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
+            let g = Glossary(text: args.count > i + 3 ? args[i + 3] : "")
+            Task { @MainActor in
+                print((try? await Translator().translate(args[i + 2], d, glossary: g)) ?? "<error>")
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
         let files = args[(i + 2)...].map { URL(fileURLWithPath: $0) }
