@@ -26,6 +26,41 @@ enum Entry {
             Task { @MainActor in await TTSBench.run(root: URL(fileURLWithPath: args[i + 1]), out: URL(fileURLWithPath: args[i + 2])); exit(0) }
             RunLoop.main.run()
         }
+        if let i = args.firstIndex(of: "--systemtest") {     // --systemtest all|<bundle id> en|zh seconds [--engine e]
+            let source = args[i + 1] == "all" ? ListenSource.allApps : .app(args[i + 1])
+            let d: Direction = args[i + 2] == "zh" ? .zhToEn : .enToZh
+            let seconds = Double(args[i + 3]) ?? 30
+            let engine = args.firstIndex(of: "--engine").flatMap { SpeechEngine(rawValue: args[$0 + 1]) } ?? .apple
+            // When launched by Finder (`open --args`), output goes to a file on the Desktop too.
+            let log = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/systemtest.txt")
+            try? FileManager.default.createDirectory(at: log.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data().write(to: log)
+            func print(_ items: Any...) {
+                let line = items.map { "\($0)" }.joined(separator: " ")
+                Swift.print(line)
+                if let h = try? FileHandle(forWritingTo: log) { h.seekToEndOfFile(); h.write(Data((line + "\n").utf8)); try? h.close() }
+            }
+            Task { @MainActor in
+                let mic = Microphone()
+                var peak: Float = 0
+                mic.onLevel = { peak = max(peak, $0) }
+                let rec: SpeechRecognizing = engine == .apple ? Recognizer() : ModelRecognizer(engine: engine)
+                let t0 = Date()
+                do {
+                    try await rec.start(direction: d, vocabulary: [], input: { f in
+                        try mic.start(uid: nil, format: f, echoCancellation: false, source: source)
+                    }, onPartial: { _ in }, onCommit: { _, text, _, _ in
+                        print(String(format: "[%.1fs] %@", Date().timeIntervalSince(t0), text))
+                    }, onRevise: { _, text in print("  revised:", text) }, onError: { print("error:", $0) })
+                } catch { print("start failed:", error.localizedDescription); exit(1) }
+                print("listening to:", source.raw, "— apps:", SystemAudio.apps().prefix(6).map { "\($0.name)\($0.playing ? "*" : "")" })
+                try? await Task.sleep(for: .seconds(seconds))
+                print("buffers received:", mic.buffersReceived, "loudest level:", peak)
+                mic.stop(); await rec.stop()
+                exit(0)
+            }
+            RunLoop.main.run()
+        }
         if let i = args.firstIndex(of: "--voicepack"), let pack = VoicePack(rawValue: args[i + 1]) {
             Task { @MainActor in
                 ModelStore.shared.download(pack)

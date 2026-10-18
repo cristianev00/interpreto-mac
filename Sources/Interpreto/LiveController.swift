@@ -61,6 +61,28 @@ final class LiveController {
         }
     }
 
+    /// What Interpreto listens to: the microphone, all Mac sound, or one app.
+    var source: ListenSource {
+        get { ListenSource(defaults.string(forKey: Pref.listenSource)) }
+        set {
+            defaults.set(newValue.raw, forKey: Pref.listenSource)
+            sourceVersion += 1
+            if isListening { stop(); Task { try? await Task.sleep(for: .milliseconds(300)); start() } }
+        }
+    }
+    private(set) var sourceVersion = 0        // lets views refresh when the source changes
+
+    /// Short name of the source, for the record button.
+    var sourceName: String {
+        _ = sourceVersion
+        switch source {
+        case .microphone: return "Microphone"
+        case .allApps: return "Mac sound"
+        case .app(let id): return SystemAudio.apps().first { $0.id == id }?.name
+            ?? NSWorkspace.shared.urlForApplication(withBundleIdentifier: id).map { $0.deletingPathExtension().lastPathComponent } ?? id
+        }
+    }
+
     /// Name of the speech engine for the current direction (what the sidebar shows).
     var engineName: String {
         let e = SpeechEngine.chosen(for: direction)
@@ -118,8 +140,10 @@ final class LiveController {
             let chosenOut = (defaults.string(forKey: Pref.outputUID) ?? "").isEmpty ? nil : defaults.string(forKey: Pref.outputUID)
             let defaultIn = AudioDevices.defaultUID(input: true), defaultOut = AudioDevices.defaultUID(input: false)
             let micUID = chosenMic ?? defaultIn, outUID = chosenOut ?? defaultOut
-            let needsProtection = defaults.bool(forKey: Pref.speak) && AudioDevices.isLoudspeaker(outUID)
-                && !AudioDevices.isHeadset(micUID)
+            let source = ListenSource(defaults.string(forKey: Pref.listenSource))
+            // Listening to the Mac's sound: Interpreto's own voice is excluded from the capture.
+            let needsProtection = source == .microphone && defaults.bool(forKey: Pref.speak)
+                && AudioDevices.isLoudspeaker(outUID) && !AudioDevices.isHeadset(micUID)
             let echo = needsProtection && micUID == defaultIn && outUID == defaultOut
             mic.muteWhileSpeaking = needsProtection
             Diagnostics.event("devices: mic \(micUID ?? "-"), output \(outUID ?? "-"); protection \(needsProtection), echo cancellation \(echo)")
@@ -141,7 +165,7 @@ final class LiveController {
                     direction: direction, vocabulary: glossary.vocabulary(for: direction),
                     input: { [mic] format in
                         Diagnostics.event("listening: \(self.direction.label), echo cancellation \(echo), recognizer format \(format)")
-                        return Diagnostics.tap(try mic.start(uid: self.defaults.string(forKey: Pref.micUID), format: format, echoCancellation: echo), format: format)
+                        return Diagnostics.tap(try mic.start(uid: self.defaults.string(forKey: Pref.micUID), format: format, echoCancellation: echo, source: source), format: format)
                     },
                     onPartial: { [weak self] in self?.partialChanged($0) },
                     onCommit: { [weak self] id, text, start, end in self?.committed(id, text, start, end) },

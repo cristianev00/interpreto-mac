@@ -14,6 +14,7 @@
 	<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
 	<key>NSHighResolutionCapable</key><true/>
 	<key>NSMicrophoneUsageDescription</key><string>Interpreto listens to your microphone to translate what is said. Audio never leaves your Mac.</string>
+	<key>NSAudioCaptureUsageDescription</key><string>Interpreto listens to the sound of apps such as Zoom, Teams or a video to translate what is said. Audio never leaves your Mac.</string>
 	<key>NSSpeechRecognitionUsageDescription</key><string>Interpreto turns speech into text on your Mac to translate it.</string>
 	<key>NSHumanReadableCopyright</key><string>© 2026 Interpreto</string>
 </dict>

@@ -80,6 +80,8 @@ struct LiveView: View {
         .onChange(of: live.session.id) { following = true }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                SourceMenu()
+
                 Toggle(isOn: $speak) {
                     Label("Speak Translation", systemImage: speak ? "speaker.wave.2.fill" : "speaker.slash")
                 }
@@ -239,12 +241,12 @@ struct RecordCapsule: View {
                 Text(live.isListening ? "Listening…" : "Start Listening").font(.headline)
                 if live.isListening {
                     TimelineView(.periodic(from: .now, by: 1)) { _ in
-                        Text("\(live.direction.label) · \(clock(live.elapsed))")
+                        Text("\(live.direction.label) · \(live.sourceName) · \(clock(live.elapsed))")
                     }
                     .font(.subheadline.monospacedDigit())
                     .foregroundStyle(.secondary)
                 } else {
-                    Text(live.direction.label).font(.subheadline).foregroundStyle(.secondary)
+                    Text("\(live.direction.label) · \(live.sourceName)").font(.subheadline).foregroundStyle(.secondary)
                 }
             }
             .frame(minWidth: 150, alignment: .leading)
@@ -256,5 +258,37 @@ struct RecordCapsule: View {
 
     private func clock(_ s: Double) -> String {
         String(format: "%02d:%02d", Int(s) / 60, Int(s) % 60)
+    }
+}
+
+/// "Listen to": the microphone, all sound on this Mac, or one app (Zoom, Teams, a browser…).
+struct SourceMenu: View {
+    @Environment(LiveController.self) private var live
+
+    var body: some View {
+        let current = live.source
+        Menu {
+            Picker("Listen to", selection: Binding(get: { current }, set: { live.source = $0 })) {
+                Label("Microphone", systemImage: "mic").tag(ListenSource.microphone)
+                Label("All sound on this Mac", systemImage: "macbook").tag(ListenSource.allApps)
+            }
+            .pickerStyle(.inline)
+            let apps = SystemAudio.apps()
+            if !apps.isEmpty {
+                Section("An app") {
+                    ForEach(apps) { app in
+                        Button {
+                            live.source = .app(app.id)
+                        } label: {
+                            if current == .app(app.id) { Label(app.name, systemImage: "checkmark") }
+                            else { Text(app.playing ? "\(app.name)  ♪" : app.name) }
+                        }
+                    }
+                }
+            }
+        } label: {
+            Label("Listen to", systemImage: current == .microphone ? "mic" : "speaker.wave.2.circle")
+        }
+        .help("Listen to: \(live.sourceName)")
     }
 }

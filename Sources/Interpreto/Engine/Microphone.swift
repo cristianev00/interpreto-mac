@@ -56,9 +56,11 @@ final class Microphone {
     ///   voice processing can remove it. Otherwise the microphone is recorded with
     ///   AVCaptureSession, which works with any device (the audio engine can't start when the
     ///   microphone and the speakers run at different rates, e.g. AirPods' mic + MacBook speakers).
-    func start(uid: String?, format target: AVAudioFormat, echoCancellation: Bool) throws -> AudioStream {
+    func start(uid: String?, format target: AVAudioFormat, echoCancellation: Bool,
+               source: ListenSource = .microphone) throws -> AudioStream {
         self.target = target
         echoCancelled = false
+        if source != .microphone { return try startSystem(source) }
         if !echoCancellation { return try startCapture(uid: uid) }
         let device = AudioDevices.id(forUID: uid, input: true)
         let input = engine.inputNode
@@ -144,13 +146,16 @@ final class Microphone {
         let n = Int(raw.frameLength)
         buffersReceived += 1
         buffer.frameLength = raw.frameLength
+        let stride = raw.format.isInterleaved ? Int(raw.format.channelCount) : 1
         if muteWhileSpeaking, !echoCancelled, PlaybackState.shared.isActive {
             dst.update(repeating: 0, count: n)            // the voice is playing: hear nothing
-        } else {
+        } else if stride == 1 {
             dst.update(from: ch, count: n)
+        } else {
+            for i in 0..<n { dst[i] = ch[i * stride] }    // interleaved (Mac sound): first channel
         }
         var sum: Float = 0
-        for i in 0..<n { sum += ch[i] * ch[i] }
+        for i in 0..<n { sum += dst[i] * dst[i] }
         onLevel?(sqrt(sum / Float(max(1, n))))
         let capacity = AVAudioFrameCount(Double(n) * target.sampleRate / rate) + 64
         guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
@@ -201,6 +206,21 @@ final class Microphone {
         return stream
     }
 
+    // MARK: the Mac's own sound
+
+    private var system: SystemAudio?
+
+    private func startSystem(_ source: ListenSource) throws -> AudioStream {
+        let (stream, cont) = AudioStream.makeStream(bufferingPolicy: .unbounded)
+        continuation = cont
+        buffersReceived = 0
+        let system = SystemAudio()
+        try system.start(source) { [weak self] buffer in self?.process(buffer, cont) }
+        self.system = system
+        Diagnostics.event("listening to the Mac's sound: \(source.raw)")
+        return stream
+    }
+
     private var reconnectGeneration = 0
 
     /// The audio setup changed under us (voice processing starting, a device appearing or going
@@ -231,6 +251,8 @@ final class Microphone {
     /// Stops listening. With `keepEngine`, the engine keeps running so a translation still being
     /// spoken through it can finish; call `stopEngine()` afterwards.
     func stop(keepEngine: Bool = false) {
+        system?.stop()
+        system = nil
         if let session {
             session.stopRunning()
             self.session = nil
