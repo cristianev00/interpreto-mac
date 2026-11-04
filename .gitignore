@@ -4,3 +4,6 @@ build/
 .swiftpm/
 Vendor/sherpa-onnx/lib/
 Vendor/dl/
+
+# macOS
+.DS_Store

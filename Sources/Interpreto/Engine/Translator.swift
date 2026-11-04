@@ -7,12 +7,28 @@ import Translation
 final class Translator {
     private var sessions: [Direction: TranslationSession] = [:]
 
-    private func session(_ d: Direction) -> TranslationSession {
+    /// Low latency when its model is on this Mac, otherwise high fidelity. The language packs can be
+    /// "installed" while the low-latency model is only "supported": a low-latency session then fails
+    /// every sentence with "Unable to Translate" (TranslationError.notInstalled).
+    private func session(_ d: Direction) async -> TranslationSession {
         if let s = sessions[d] { return s }
+        let fast = await LanguageAvailability(preferredStrategy: .lowLatency)
+            .status(from: d.sourceLanguage, to: d.targetLanguage) == .installed
         let s = TranslationSession(installedSource: d.sourceLanguage, target: d.targetLanguage,
-                                   preferredStrategy: .lowLatency)
+                                   preferredStrategy: fast ? .lowLatency : .highFidelity)
         sessions[d] = s
         return s
+    }
+
+    private func appleTranslate(_ input: AttributedString, _ d: Direction) async throws -> String {
+        do {
+            return try await session(d).translate(input).targetText
+        } catch TranslationError.notInstalled where sessions[d]?.preferredStrategy == .lowLatency {
+            let s = TranslationSession(installedSource: d.sourceLanguage, target: d.targetLanguage,
+                                       preferredStrategy: .highFidelity)
+            sessions[d] = s
+            return try await s.translate(input).targetText
+        }
     }
 
     /// - context: the previous sentences (used by HY-MT2 for consistent wording)
@@ -26,8 +42,7 @@ final class Translator {
             }
         }
         let input = Self.applyGlossary(text, terms: glossary.terms(for: d))
-        let response = try await session(d).translate(input)
-        var out = response.targetText
+        var out = try await appleTranslate(input, d)
         // Apple's translator occasionally answers in Traditional characters; keep Simplified.
         if d == .enToZh { out = out.applyingTransform(StringTransform("Hant-Hans"), reverse: false) ?? out }
         return tidy(out)
