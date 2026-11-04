@@ -30,8 +30,6 @@ final class ModelRecognizer: SpeechRecognizing {
 
     let engine: SpeechEngine
     private var model: UtteranceModel?
-    /// Optional second pass for finished sentences (more accurate, slower than the live model).
-    private var finalModel: UtteranceModel?
     private var feedTask: Task<Void, Never>?
 
     private var samples: [Float] = []      // the utterance so far (from just before speech began)
@@ -59,9 +57,6 @@ final class ModelRecognizer: SpeechRecognizing {
         switch engine {
         case .parakeet: model = try await ParakeetModel.load()
         case .sensevoice: model = try await Task.detached { try SenseVoiceModel.load() }.value
-        case .funasr:
-            model = try await Task.detached { try SenseVoiceModel.load() }.value
-            finalModel = try await Task.detached { try FunASRNanoModel.load() }.value
         case .apple: break
         }
     }
@@ -102,7 +97,7 @@ final class ModelRecognizer: SpeechRecognizing {
     }
 
     /// Frees the model's memory; it reloads on the next start.
-    func unload() { model = nil; finalModel = nil }
+    func unload() { model = nil }
 
     func stop() async {
         feedTask?.cancel()
@@ -224,17 +219,7 @@ final class ModelRecognizer: SpeechRecognizing {
         onPartial("")
 
         var text = liveText ?? ""
-        if let finalModel {
-            if liveText == nil { text = Self.clean((try? await model.transcribe(head)) ?? "") }
-            let refined = Self.clean((try? await finalModel.transcribe(head)) ?? "")
-            let kept = Recognizer.normalized(refined).count, heard = Recognizer.normalized(text).count
-            // Keep the second pass unless it clearly dropped words, or invented many more than
-            // the live model heard (it can hallucinate sentences from background noise).
-            if !refined.isEmpty, Double(kept) >= 0.7 * Double(heard), Double(kept) <= 1.6 * Double(heard) + 4 { text = refined }
-            else { trace("second pass disagreed (\(kept) vs \(heard) letters); keeping: \(text)") }
-        } else if liveText == nil {
-            text = Self.clean((try? await model.transcribe(head)) ?? "")
-        }
+        if liveText == nil { text = Self.clean((try? await model.transcribe(head)) ?? "") }
         trace(String(format: "commit %.2f–%.2f, %d samples left: %@", start, end, samples.count, text))
         let heard = Self.speechLoudness(head)
         loudness = 0

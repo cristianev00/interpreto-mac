@@ -23,10 +23,6 @@ cp Vendor/sherpa-onnx/lib/libsherpa-onnx-c-api.dylib Vendor/sherpa-onnx/lib/libo
 IDENTITY=$(security find-identity -p codesigning 2>/dev/null | awk '/"Interpreto Local Signing"/{print $2; exit}')
 SIGN=${IDENTITY:--}
 echo "signing with: ${IDENTITY:-ad-hoc}"
-# llama.cpp (HY-MT2 translation) ships as a framework.
-LLAMA=$(find .build/artifacts -path "*macos-arm64_x86_64/llama.framework" -maxdepth 6 | head -1)
-ditto "$LLAMA" "$APP/Contents/Frameworks/llama.framework"
-codesign --force --sign "$SIGN" "$APP/Contents/Frameworks/llama.framework"
 codesign --force --sign "$SIGN" "$APP"/Contents/Frameworks/*.dylib
 codesign --force --sign "$SIGN" --options runtime --entitlements Resources/Interpreto.entitlements "$APP"
 codesign --verify --deep "$APP"

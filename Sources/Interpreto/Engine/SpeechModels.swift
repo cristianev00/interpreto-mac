@@ -8,14 +8,10 @@ import Observation
 /// SenseVoice ~25% fewer on Mandarin.
 enum SpeechEngine: String, CaseIterable, Identifiable {
     case apple, parakeet, sensevoice
-    /// Chinese, two passes: SenseVoice for the live words, Fun-ASR-Nano for each finished sentence.
-    /// Measured: 2.6% errors on standard Mandarin (SenseVoice 2.9%) and 8.2% on 9 regional accents
-    /// (SenseVoice 13.4%), +~0.3 s per sentence.
-    case funasr
     var id: String { rawValue }
 
     static func options(for d: Direction) -> [SpeechEngine] {
-        d == .enToZh ? [.apple, .parakeet] : [.apple, .sensevoice, .funasr]
+        d == .enToZh ? [.apple, .parakeet] : [.apple, .sensevoice]
     }
 
     static func chosen(for d: Direction) -> SpeechEngine {
@@ -28,7 +24,6 @@ enum SpeechEngine: String, CaseIterable, Identifiable {
         case .apple: "Apple (built in)"
         case .parakeet: "Parakeet — best with accents"
         case .sensevoice: "SenseVoice — fast, accurate Chinese"
-        case .funasr: "Fun-ASR-Nano — best with regional accents"
         }
     }
 
@@ -37,7 +32,6 @@ enum SpeechEngine: String, CaseIterable, Identifiable {
         case .apple: "Apple"
         case .parakeet: "Parakeet model"
         case .sensevoice: "SenseVoice model"
-        case .funasr: "Fun-ASR-Nano model"
         }
     }
 
@@ -46,7 +40,6 @@ enum SpeechEngine: String, CaseIterable, Identifiable {
         case .apple: ""
         case .parakeet: "about 480 MB"
         case .sensevoice: "about 230 MB"
-        case .funasr: "about 840 MB, plus SenseVoice"
         }
     }
 }
@@ -59,8 +52,6 @@ final class ModelStore {
 
     enum State: Equatable { case notInstalled, downloading(Double), installed, failed(String) }
     private(set) var states: [SpeechEngine: State] = [:]
-    /// The optional English → Chinese translation model (HY-MT2).
-    private(set) var hymt2: State = .notInstalled
     private(set) var voiceStates: [VoicePack: State] = [:]
 
     func state(_ p: VoicePack) -> State {
@@ -132,9 +123,6 @@ final class ModelStore {
     nonisolated static let folder = URL.applicationSupportDirectory.appending(path: "Interpreto/Models", directoryHint: .isDirectory)
     nonisolated static var parakeetFolder: URL { folder.appending(path: "parakeet", directoryHint: .isDirectory) }
     nonisolated static var senseVoiceFolder: URL { folder.appending(path: "sensevoice", directoryHint: .isDirectory) }
-    nonisolated static var funASRFolder: URL { folder.appending(path: "sherpa-onnx-funasr-nano-int8-2025-12-30", directoryHint: .isDirectory) }
-    nonisolated static let funASRURL = URL(string: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-funasr-nano-int8-2025-12-30.tar.bz2")!
-    nonisolated static let funASRSHA256 = "eb43d7ccc2e86b243f6a03b7df361033dda66db9523d1a92bf6aca2b50c9476b"
     nonisolated static let senseVoiceFiles = ["model.int8.onnx", "tokens.txt"]
     nonisolated static let senseVoiceRepo = "csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 
@@ -143,8 +131,7 @@ final class ModelStore {
     func state(_ e: SpeechEngine) -> State { e == .apple ? .installed : states[e] ?? .notInstalled }
 
     func refresh() {
-        if case .downloading = hymt2 {} else { hymt2 = HYMT2.isInstalled ? .installed : .notInstalled }
-        for e in [SpeechEngine.parakeet, .sensevoice, .funasr] {
+        for e in [SpeechEngine.parakeet, .sensevoice] {
             if case .downloading = states[e] { continue }
             states[e] = Self.isInstalled(e) ? .installed : .notInstalled
         }
@@ -157,8 +144,6 @@ final class ModelStore {
         case .sensevoice: senseVoiceFiles.allSatisfy {
             FileManager.default.fileExists(atPath: senseVoiceFolder.appending(path: $0).path)
         }
-        case .funasr: isInstalled(.sensevoice)
-            && FileManager.default.fileExists(atPath: funASRFolder.appending(path: "llm.int8.onnx").path)
         }
     }
 
@@ -176,16 +161,6 @@ final class ModelStore {
                     }
                 case .sensevoice:
                     try await downloadSenseVoice()
-                case .funasr:
-                    if !Self.isInstalled(.sensevoice) { try await downloadSenseVoice() }
-                    let tmp = try await Self.fetch(Self.funASRURL) { p in
-                        Task { @MainActor in ModelStore.shared.states[.funasr] = .downloading(p) }
-                    }
-                    guard try await Self.sha256(tmp) == Self.funASRSHA256 else {
-                        throw NSError(domain: "Interpreto", code: 22, userInfo: [NSLocalizedDescriptionKey: "The download was damaged."])
-                    }
-                    try await Self.untar(tmp, into: Self.folder)
-                    try? FileManager.default.removeItem(at: tmp)
                 }
                 states[e] = Self.isInstalled(e) ? .installed : .failed("The download didn’t complete.")
             } catch {
@@ -197,47 +172,10 @@ final class ModelStore {
     func remove(_ e: SpeechEngine) {
         // FluidAudio keeps Parakeet in a folder named after its repository, next to ours.
         let dirs = e == .parakeet ? [Self.parakeetFolder, Self.folder.appending(path: "parakeet-tdt-0.6b-v3")]
-                 : e == .funasr ? [Self.funASRFolder] : [Self.senseVoiceFolder]
+                 : [Self.senseVoiceFolder]
         for d in dirs where FileManager.default.fileExists(atPath: d.path) {
             try? FileManager.default.trashItem(at: d, resultingItemURL: nil)
         }
-        refresh()
-    }
-
-    func downloadHYMT2() {
-        if case .downloading = hymt2 { return }
-        hymt2 = .downloading(0)
-        Task {
-            do {
-                try FileManager.default.createDirectory(at: HYMT2.folder, withIntermediateDirectories: true)
-                // Hugging Face (or its mirror), then ModelScope (works in mainland China).
-                let sources = ["\(Self.hfBase)/tencent/Hy-MT2-1.8B-GGUF/resolve/main/\(HYMT2.fileName)",
-                               "https://modelscope.cn/models/Tencent-Hunyuan/Hy-MT2-1.8B-GGUF/resolve/master/\(HYMT2.fileName)"]
-                await Self.chooseMirror()
-                var lastError: Error = URLError(.cannotConnectToHost)
-                for source in sources {
-                    do {
-                        let tmp = try await Self.fetch(URL(string: source)!) { p in
-                            Task { @MainActor in ModelStore.shared.hymt2 = .downloading(p) }
-                        }
-                        let magic = try FileHandle(forReadingFrom: tmp).read(upToCount: 4)
-                        guard magic == Data("GGUF".utf8) else { throw URLError(.cannotDecodeContentData) }
-                        try? FileManager.default.removeItem(at: HYMT2.modelURL)
-                        try FileManager.default.moveItem(at: tmp, to: HYMT2.modelURL)
-                        hymt2 = .installed
-                        return
-                    } catch { lastError = error }
-                }
-                throw lastError
-            } catch {
-                hymt2 = .failed(error.localizedDescription)
-            }
-        }
-    }
-
-    func removeHYMT2() {
-        Task { await HYMT2.shared.unload() }
-        try? FileManager.default.trashItem(at: HYMT2.folder, resultingItemURL: nil)
         refresh()
     }
 
@@ -334,31 +272,6 @@ actor SenseVoiceModel: UtteranceModel {
         var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80),
                                                        modelConfig: model)
         return SenseVoiceModel(recognizer: SherpaOnnxOfflineRecognizer(config: &config))
-    }
-
-    func transcribe(_ samples: [Float]) async throws -> String {
-        guard samples.count >= 4_000 else { return "" }
-        return recognizer.decode(samples: samples, sampleRate: 16_000).text
-    }
-}
-
-/// Alibaba Fun-ASR-Nano (int8; audio encoder + Qwen3-0.6B decoder) on the CPU (sherpa-onnx).
-actor FunASRNanoModel: UtteranceModel {
-    private let recognizer: SherpaOnnxOfflineRecognizer
-
-    private init(recognizer: SherpaOnnxOfflineRecognizer) { self.recognizer = recognizer }
-
-    static func load() throws -> FunASRNanoModel {
-        let d = ModelStore.funASRFolder
-        let nano = sherpaOnnxOfflineFunASRNanoModelConfig(
-            encoderAdaptor: d.appending(path: "encoder_adaptor.int8.onnx").path,
-            llm: d.appending(path: "llm.int8.onnx").path,
-            embedding: d.appending(path: "embedding.int8.onnx").path,
-            tokenizer: d.appending(path: "Qwen3-0.6B").path)
-        let model = sherpaOnnxOfflineModelConfig(tokens: "", numThreads: 4, funasrNano: nano)
-        var config = sherpaOnnxOfflineRecognizerConfig(featConfig: sherpaOnnxFeatureConfig(sampleRate: 16_000, featureDim: 80),
-                                                       modelConfig: model)
-        return FunASRNanoModel(recognizer: SherpaOnnxOfflineRecognizer(config: &config))
     }
 
     func transcribe(_ samples: [Float]) async throws -> String {

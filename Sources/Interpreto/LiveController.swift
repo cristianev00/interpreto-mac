@@ -42,7 +42,7 @@ final class LiveController {
     }
 
     /// Three minutes after listening stops (and nothing is being spoken), free the optional
-    /// models' memory (speech models, HY-MT2, natural voices: up to ~3 GB). They reload in about
+    /// models' memory (speech models and natural voices: up to ~1 GB). They reload in about
     /// a second when listening starts again.
     private var idleTask: Task<Void, Never>?
     static let idleSeconds = 180.0
@@ -55,7 +55,6 @@ final class LiveController {
             while self.speaker.isSpeaking { try? await Task.sleep(for: .seconds(5)) }
             guard !self.isListening, !Task.isCancelled else { return }
             for r in self.modelRecognizers.values { r.unload() }
-            await HYMT2.shared.unload()
             await VoiceEngine.shared.unload()
             Diagnostics.event("idle: optional models unloaded")
         }
@@ -187,7 +186,7 @@ final class LiveController {
     var engineName: String {
         let e = SpeechEngine.chosen(for: direction)
         let use = (e != .apple && ModelStore.shared.state(e) == .installed) ? e : .apple
-        return ["apple": "Apple", "parakeet": "Parakeet", "sensevoice": "SenseVoice", "funasr": "Fun-ASR-Nano"][use.rawValue]!
+        return ["apple": "Apple", "parakeet": "Parakeet", "sensevoice": "SenseVoice"][use.rawValue]!
     }
 
     /// Loads the chosen model ahead of time, so pressing record starts at once.
@@ -428,11 +427,9 @@ final class LiveController {
         }
     }
 
-    /// Translates a sentence, giving the translator the two sentences before it as context.
+    /// Translates a finished sentence.
     private func translate(_ text: String, _ d: Direction, before id: UUID) async -> String {
-        let i = session.items.firstIndex { $0.id == id } ?? session.items.count
-        let context = session.items[..<i].suffix(2).map(\.source)
-        do { return try await translator.translate(text, d, glossary: glossary, context: Array(context)) }
+        do { return try await translator.translate(text, d, glossary: glossary) }
         catch { message = "Translation failed: \(error.localizedDescription)"; return "" }
     }
 

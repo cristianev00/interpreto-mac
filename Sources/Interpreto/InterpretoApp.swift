@@ -57,14 +57,9 @@ struct InterpretoApp: App {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
 
-    /// Release the translation model from the GPU before quitting (llama.cpp requires it).
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         Diagnostics.event("app quitting (\(NSApp.windows.filter(\.isVisible).count) windows open)")
-        Task {
-            await HYMT2.shared.unload()
-            await MainActor.run { NSApp.reply(toApplicationShouldTerminate: true) }
-        }
-        return .terminateLater
+        return .terminateNow
     }
 }
 
@@ -117,7 +112,6 @@ struct ContentView: View {
             if CommandLine.arguments.contains("--diagnose") { live.recordDiagnostics() }
             if CommandLine.arguments.contains("--configtest") {
                 await ConfigTest.run(live)
-                await HYMT2.shared.unload()
                 exit(0)
             }
         }

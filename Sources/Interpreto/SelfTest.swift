@@ -118,81 +118,10 @@ enum Entry {
                     print(String(format: "%@: %d clauses; first clause ready in %.2fs (%.1fs of audio); whole sentence at once %.2fs",
                                  id, clauses.count, firstTime, Double(first?.samples.count ?? 0) / Double(first?.rate ?? 1), Date().timeIntervalSince(whole)))
                 }
-                try? await HYMT2.shared.load()
-                print(String(format: "memory with voices + HY-MT2 loaded: %.0f MB", rss()))
-                await HYMT2.shared.unload(); await VoiceEngine.shared.unload()
+                print(String(format: "memory with voices loaded: %.0f MB", rss()))
+                await VoiceEngine.shared.unload()
                 try? await Task.sleep(for: .seconds(1))
                 print(String(format: "memory after unloading: %.0f MB", rss()))
-                exit(0)
-            }
-            RunLoop.main.run()
-        }
-        if let i = args.firstIndex(of: "--hymt") {           // --hymt en|zh lines.txt out.json
-            Task {
-                let d: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
-                let lines = (try? String(contentsOfFile: args[i + 2], encoding: .utf8))?.split(separator: "\n").map(String.init) ?? []
-                let t0 = Date()
-                try? await HYMT2.shared.load()
-                print(String(format: "loaded in %.2fs", Date().timeIntervalSince(t0)))
-                var outs: [[String: Any]] = []
-                for l in lines {
-                    let t = Date()
-                    let tr = (try? await HYMT2.shared.translate(l, d, context: [], terms: [])) ?? "<error>"
-                    outs.append(["text": tr, "secs": Date().timeIntervalSince(t)])
-                }
-                try? JSONSerialization.data(withJSONObject: ["swift-hymt2": outs]).write(to: URL(fileURLWithPath: args[i + 3]))
-                let secs = outs.compactMap { $0["secs"] as? Double }.sorted()
-                print(String(format: "median %.2fs", secs[secs.count / 2]), outs.prefix(2).map { $0["text"]! })
-                await HYMT2.shared.unload()          // llama.cpp must free the GPU before exit
-                exit(0)
-            }
-            RunLoop.main.run()
-        }
-        if let i = args.firstIndex(of: "--download"), let e = SpeechEngine(rawValue: args[i + 1]) {
-            Task { @MainActor in
-                let store = ModelStore.shared
-                store.download(e)
-                var last = -1
-                while true {
-                    switch store.state(e) {
-                    case .downloading(let p):
-                        if Int(p * 10) != last { last = Int(p * 10); print("downloading \(e.rawValue): \(Int(p * 100)) %") }
-                    case .installed: print("installed:", e.rawValue); exit(0)
-                    case .failed(let m): print("failed:", m); exit(1)
-                    case .notInstalled: break
-                    }
-                    try? await Task.sleep(for: .milliseconds(500))
-                }
-            }
-            RunLoop.main.run()
-        }
-        if args.contains("--reusetest") {                    // app sequence: same mic, echo off then on
-            func note(_ t: String) {
-                let url = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/reusetest.txt")
-                let line = t + "\n"
-                if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
-                else { try? Data(line.utf8).write(to: url) }
-            }
-            note("launched; mic permission status \(AVCaptureDevice.authorizationStatus(for: .audio).rawValue) (3 = allowed)")
-            Task { @MainActor in
-                note("task running")
-                let mic = Microphone(), speaker = Speaker()
-                let fmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: 16000, channels: 1, interleaved: false)!
-                for echo in [false, true, true] {
-                    speaker.use(engine: echo ? mic.engine : nil)
-                    note("starting mic, echo \(echo)")
-                    let s: AudioStream
-                    do { s = try mic.start(uid: nil, format: fmt, echoCancellation: echo) } catch { note("start failed: \(error)"); continue }
-                    note("mic started")
-                    let drain = Task.detached { for await _ in s {} }
-                    try? await Task.sleep(for: .seconds(2))
-                    let line = "RESULT echo \(echo): \(mic.buffersReceived) buffers in 2 s, VP \(mic.engine.inputNode.isVoiceProcessingEnabled), input format \(mic.engine.inputNode.outputFormat(forBus: 0)), running \(mic.engine.isRunning)\n"
-                    print(line, terminator: "")
-                    let url = URL.desktopDirectory.appending(path: "Interpreto Diagnostics/reusetest.txt")
-                    if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close() }
-                    else { try? Data(line.utf8).write(to: url) }
-                    mic.stop(); drain.cancel()
-                }
                 exit(0)
             }
             RunLoop.main.run()
@@ -204,11 +133,9 @@ enum Entry {
         guard let i = args.firstIndex(of: "--selftest") else { InterpretoApp.main(); return }
         let dir: Direction = args[i + 1] == "zh" ? .zhToEn : .enToZh
         let engine = args.firstIndex(of: "--engine").flatMap { SpeechEngine(rawValue: args[$0 + 1]) } ?? .apple
-        if let t = args.firstIndex(of: "--translator") { UserDefaults.standard.set(args[t + 1], forKey: Pref.translatorZH) }
         let files = args[(i + 2)...].filter { $0.hasSuffix(".wav") }.map { URL(fileURLWithPath: $0) }
         Task { @MainActor in
             await SelfTest.run(dir, files, engine: engine)
-            await HYMT2.shared.unload()
             exit(0)
         }
         RunLoop.main.run()

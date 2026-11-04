@@ -82,9 +82,12 @@ enum Pref {
     static let engineEN = "engineEN"      // speech engine when English is spoken
     static let engineZH = "engineZH"      // speech engine when Chinese is spoken
     static let listenSource = "listenSource"  // "mic", "all" or "app:<bundle id>"
-    static let translatorZH = "translatorZH"  // English → Chinese translator: "apple" or "hymt2"
 
     static func register() {
+        // Fun-ASR-Nano and HY-MT2 were removed (too heavy): fall back to the light engines.
+        let d = UserDefaults.standard
+        if d.string(forKey: engineZH) == "funasr" { d.set(SpeechEngine.sensevoice.rawValue, forKey: engineZH) }
+        d.removeObject(forKey: "translatorZH")
         UserDefaults.standard.register(defaults: [
             direction: Direction.enToZh.rawValue, speak: false, textSize: 24.0,
             showOriginal: true, livePreview: true, glossary: "",
