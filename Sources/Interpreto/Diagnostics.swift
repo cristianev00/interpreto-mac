@@ -2,9 +2,10 @@ import AVFoundation
 import Foundation
 import Speech
 
-/// Help → Record Diagnostics: saves 30 seconds of exactly what the speech recognizer hears, plus a
-/// timeline of events (pauses, recognizer results, sentences, when the voice speaks), to a folder
-/// on the Desktop. Used to see what happens on a real Mac in a real room.
+/// Help → Start Recording for Analysis: saves exactly what the speech recognizer hears (heard.caf),
+/// a timeline of events (pauses, recognizer results, sentences, translations and their delay, when
+/// the voice speaks, memory) and the transcript (session.json) to a folder on the Desktop.
+/// `scripts/analyze-recording.sh <folder>` turns it into a report.
 enum Diagnostics {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var log: FileHandle?
@@ -27,6 +28,28 @@ enum Diagnostics {
         }
         event("diagnostics started")
         event("input: \(AudioDevices.list(input: true).map(\.name)), output: \(AudioDevices.list(input: false).map(\.name))")
+    }
+
+    /// Resident memory of the app, in MB.
+    static func memoryMB() -> Double {
+        var info = mach_task_basic_info()
+        var n = mach_msg_type_number_t(MemoryLayout<mach_task_basic_info>.size / 4)
+        _ = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(n)) { task_info(mach_task_self_, task_flavor_t(MACH_TASK_BASIC_INFO), $0, &n) }
+        }
+        return Double(info.resident_size) / 1e6
+    }
+
+    /// Saves what was heard and translated during the recording.
+    static func saveTranscript(_ items: [Utterance], direction: Direction) {
+        guard let dir = lock.withLock({ folder }) else { return }
+        let rows: [[String: Any]] = items.map {
+            ["source": $0.source, "translation": $0.translation, "start": $0.start, "end": $0.end, "notSpoken": $0.notSpoken]
+        }
+        let doc: [String: Any] = ["direction": direction.rawValue, "items": rows]
+        if let data = try? JSONSerialization.data(withJSONObject: doc, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: dir.appending(path: "session.json"))
+        }
     }
 
     static func end() {

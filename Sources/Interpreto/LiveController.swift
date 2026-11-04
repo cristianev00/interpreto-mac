@@ -319,25 +319,48 @@ final class LiveController {
         }
     }
 
-    /// Help → Record Diagnostics: listen for 30 s while recording what the recognizer hears.
-    func recordDiagnostics() {
+    /// Help → Start Recording for Analysis: listens (in the current direction, with the current
+    /// engine and voice) while recording what the recognizer hears, until stopped or `maxSeconds`.
+    private(set) var isRecordingDiagnostics = false
+    private var diagnosticsTask: Task<Void, Never>?
+    private var diagnosticsFirstItem = 0
+
+    func toggleRecording() { isRecordingDiagnostics ? stopRecording() : recordDiagnostics(maxSeconds: 600) }
+
+    func recordDiagnostics(maxSeconds: Int = 30) {
         guard !Diagnostics.isRecording else { return }
         if isListening { stop() }
         Diagnostics.begin()
-        Task {
+        isRecordingDiagnostics = true
+        diagnosticsFirstItem = session.items.count
+        let voice = defaults.string(forKey: direction == .enToZh ? Pref.voiceZH : Pref.voiceEN) ?? ""
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
+        Diagnostics.event("settings: app \(version), \(direction.label), speech engine \(engineName), voice \(voice.isEmpty ? "automatic" : voice), speak \(defaults.bool(forKey: Pref.speak)), source \(source.raw), glossary terms \(glossary.pairs.count)")
+        diagnosticsTask = Task {
             try? await Task.sleep(for: .milliseconds(600))
             start()
-            for _ in 0..<30 {
+            for second in 1...maxSeconds {
                 try? await Task.sleep(for: .seconds(1))
+                if Task.isCancelled { break }
                 let input = mic.engine.inputNode
                 Diagnostics.event("mic health: \(mic.buffersReceived) buffers, engine running \(mic.engine.isRunning), echo cancellation \(input.isVoiceProcessingEnabled), listening \(isListening), starting \(isStarting), input \(input.outputFormat(forBus: 0))")
+                if second % 5 == 0 { Diagnostics.event(String(format: "memory %.0f MB", Diagnostics.memoryMB())) }
             }
-            stop()
-            try? await Task.sleep(for: .seconds(2))
-            Diagnostics.end()
-            if let f = Diagnostics.folder { NSWorkspace.shared.activateFileViewerSelecting([f]) }
-            message = "Diagnostics saved in “Interpreto Diagnostics” on your Desktop."
+            await finishRecording()
         }
+    }
+
+    func stopRecording() { diagnosticsTask?.cancel() }
+
+    private func finishRecording() async {
+        stop()
+        try? await Task.sleep(for: .seconds(2))           // let the last translation and voice finish
+        Diagnostics.event(String(format: "memory %.0f MB", Diagnostics.memoryMB()))
+        Diagnostics.saveTranscript(Array(session.items.dropFirst(diagnosticsFirstItem)), direction: direction)
+        Diagnostics.end()
+        isRecordingDiagnostics = false
+        if let f = Diagnostics.folder { NSWorkspace.shared.activateFileViewerSelecting([f]) }
+        message = "Recording saved in “Interpreto Diagnostics” on your Desktop."
     }
 
     func newSession() {
@@ -401,6 +424,8 @@ final class LiveController {
             let t0 = Date()
             let tr = await translate(text, d, before: id)
             lastDelay = Date().timeIntervalSince(t0)
+            let translatedAt = Date()
+            Diagnostics.event(String(format: "TRANSLATED in %.2fs: %@", lastDelay ?? 0, tr))
             update(id) { $0.translation = tr; $0.isTranslating = false }
             if defaults.bool(forKey: Pref.speak), !tr.isEmpty {
                 let voiceKey = d == .enToZh ? Pref.voiceZH : Pref.voiceEN
@@ -408,7 +433,10 @@ final class LiveController {
                 let spoken = speaker.speak(tr, language: d.targetVoiceLanguage,
                                            voiceID: defaults.string(forKey: voiceKey),
                                            outputUID: defaults.string(forKey: Pref.outputUID),
-                                           onStart: { [weak self] in self?.speakingID = id; Diagnostics.event("voice starts playing") })
+                                           onStart: { [weak self] in
+                                               self?.speakingID = id
+                                               Diagnostics.event(String(format: "voice starts playing %.2fs after the translation", Date().timeIntervalSince(translatedAt)))
+                                           })
                 if !spoken { update(id) { $0.notSpoken = true } }
             }
             scheduleSave()

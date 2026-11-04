@@ -33,6 +33,21 @@ Self-test: streams recordings through the real pipeline at real-time speed:
 
 Audio device check: `--configtest` (each input/output pair, echo protection).
 
+## Record and analyze a real session
+
+Help → **Start Recording for Analysis** (⇧⌘R) listens in the current direction with your current
+engine and voice, until you choose **Stop Recording** (10 minutes at most). It saves to
+`~/Desktop/Interpreto Diagnostics/<time>/`: `heard.caf` (exactly what the recognizer heard),
+`events.log` (settings, pauses, sentences, translation times, when the voice started, memory)
+and `session.json` (what was heard and translated). Then:
+
+    scripts/analyze-recording.py ~/Desktop/Interpreto\ Diagnostics/<time> [reference.txt]
+
+prints the live timings and transcript, and streams the same audio through every downloaded
+engine for that language. With `reference.txt` (what was really said) it scores each engine.
+Tip: audio played by this Mac is removed by echo cancellation while the voice is on, so speak
+yourself, or turn the voice off when playing recordings to the microphone.
+
 ## Third-party
 
 FluidAudio (Apache-2.0) for Parakeet and Paradee-8M (Apache-2.0), sherpa-onnx (Apache-2.0) for SenseVoice and Matcha,

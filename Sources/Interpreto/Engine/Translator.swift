@@ -17,6 +17,7 @@ final class Translator {
         let s = TranslationSession(installedSource: d.sourceLanguage, target: d.targetLanguage,
                                    preferredStrategy: fast ? .lowLatency : .highFidelity)
         sessions[d] = s
+        Diagnostics.event("translator: Apple, \(fast ? "low latency" : "high fidelity")")
         return s
     }
 

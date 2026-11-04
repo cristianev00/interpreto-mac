@@ -28,7 +28,8 @@ struct InterpretoApp: App {
                 Button("New Session") { live.newSession() }.keyboardShortcut("n")
             }
             CommandGroup(after: .help) {
-                Button("Record Diagnostics (30 s)") { live.recordDiagnostics() }
+                Button(live.isRecordingDiagnostics ? "Stop Recording" : "Start Recording for Analysis") { live.toggleRecording() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
                 Button("Test Audio Devices…") {
                     Task {
                         await ConfigTest.run(live)
