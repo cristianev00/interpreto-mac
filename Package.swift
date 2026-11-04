@@ -40,5 +40,13 @@ let package = Package(
                 ]),
             ]
         ),
+        // `swift test` (Swift Testing, from Xcode's toolchain): glossary, term fixer, text tidying.
+        .testTarget(
+            name: "InterpretoTests",
+            dependencies: ["Interpreto"],
+            path: "Tests/InterpretoTests",
+            swiftSettings: [.swiftLanguageMode(.v5)],
+            linkerSettings: [.unsafeFlags(["-Xlinker", "-rpath", "-Xlinker", sherpaLib])]
+        ),
     ]
 )
