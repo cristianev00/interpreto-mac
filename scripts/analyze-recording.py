@@ -65,13 +65,17 @@ def rerun(caf, direction, engine):
         subprocess.run(["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", caf, wav], check=True)
         out = subprocess.run([APP, "--selftest", direction, "--engine", engine, wav],
                              capture_output=True, text=True, timeout=3600).stdout.splitlines()
-    sentences, delays = [], []
+    sentences, delays, lengths, firsts = [], [], [], []
     for i, line in enumerate(out):
-        m = re.match(r"\[sentence ([\d.]+)s, translated ([\d.]+)s after the last word\]", line)
+        m = re.match(r"\[sentence ([\d.]+)s, translated ([\d.]+)s after the last word"
+                     r"(?:; ([\d.]+)s of speech, first piece ([\d.]+)s)?", line)
         if m and i + 2 < len(out):
             delays.append(float(m.group(2)))
+            if m.group(3):
+                lengths.append(float(m.group(3)))
+                firsts.append(float(m.group(4)))
             sentences.append((out[i + 1].strip(), out[i + 2].strip().lstrip("→ ").strip()))
-    return sentences, delays
+    return sentences, delays, lengths, firsts
 
 
 def main():
@@ -124,13 +128,16 @@ def main():
         if not INSTALLED[engine]:
             print(f"### {engine}: not downloaded, skipped\n")
             continue
-        sentences, delays = rerun(caf, direction, engine)
+        sentences, delays, lengths, firsts = rerun(caf, direction, engine)
         heard = " ".join(s for s, _ in sentences)
         score = ""
         if reference:
             ref = tokens(reference, zh)
             score = f", {'character' if zh else 'word'} errors {100 * edits(ref, tokens(heard, zh)) / max(len(ref), 1):.1f}%"
-        print(f"### {engine}: {len(sentences)} sentences, translated {stats(delays)} after the last word{score}\n")
+        print(f"### {engine}: {len(sentences)} sentences, translated {stats(delays)} after the last word{score}")
+        if lengths:
+            print(f"- speech per sentence: {stats(lengths)}; first words translated {stats(firsts)} after the sentence ended")
+        print()
         for s, t in sentences:
             print(f"- {s}\n  → {t}")
         print()

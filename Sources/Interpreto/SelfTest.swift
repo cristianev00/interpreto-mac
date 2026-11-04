@@ -181,14 +181,21 @@ enum SelfTest {
             }, onPartial: { p in
                 print(String(format: "PARTIAL %.2f %d %@", FedClock.shared.seconds, p.count, String(p.suffix(30))))
             },
-            onCommit: { id, text, _, wordEnd in
+            onCommit: { id, text, wordStart, wordEnd in
                 let heard = FedClock.shared.seconds
                 let speechEnd = wordEnd
+                let previous = pending.last
                 pending.append(Task { @MainActor in
-                    let tr = (try? await translator.translate(text, d, glossary: Glossary(text: ""))) ?? "<error>"
+                    await previous?.value                  // in order, as in the app
+                    var parts: [String] = [], first: Double?
+                    for piece in Translator.pieces(text, chinese: d == .zhToEn) {
+                        parts.append((try? await translator.translate(piece, d, glossary: Glossary(text: ""))) ?? "<error>")
+                        if first == nil { first = FedClock.shared.seconds - speechEnd }
+                    }
                     let done = FedClock.shared.seconds
-                    print(String(format: "[sentence %.2fs, translated %.2fs after the last word]", heard - speechEnd, done - speechEnd))
-                    print("  \(text)\n  → \(tr)")
+                    print(String(format: "[sentence %.2fs, translated %.2fs after the last word; %.1fs of speech, first piece %.2fs, %d pieces]",
+                                 heard - speechEnd, done - speechEnd, wordEnd - wordStart, first ?? 0, parts.count))
+                    print("  \(text)\n  → \(parts.joined(separator: d == .zhToEn ? " " : ""))")
                 })
             }, onRevise: { _, text in
                 pending.append(Task { @MainActor in

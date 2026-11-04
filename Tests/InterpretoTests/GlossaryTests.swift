@@ -74,3 +74,34 @@ import Testing
         #expect(TermFixer.fix(sentence, terms: vocab, chinese: chinese) == sentence)
     }
 }
+
+@Suite struct LongSpeechTests {
+    @Test func longChineseIsSplitAtSentenceEnds() {
+        let t = "太多人中奖了，我们今天发了太多手机了。但是朋友们你得能拍到，你得能拍到！现在一号链接买回去都有这个试用的。"
+        let p = Translator.pieces(t, chinese: true)
+        #expect(p.count == 3)
+        #expect(p.joined() == t)
+    }
+
+    @Test func shortSentencesStayWhole() {
+        #expect(Translator.pieces("你好。谢谢。", chinese: true) == ["你好。谢谢。"])
+        #expect(Translator.pieces("Hello there. How are you?", chinese: false).count == 1)
+    }
+
+    @Test func englishSplitsOnlyAtSentenceEndsNotDecimals() {
+        let t = "Revenue grew by 3.5 percent last year in every region we serve. We expect the same next year, " +
+                "and possibly a little more if the new office opens on time. Thank you all for coming today."
+        let p = Translator.pieces(t, chinese: false)
+        #expect(p.count == 2)                           // the short last sentence joins the one before
+        #expect(p[0].hasSuffix("serve."))                // "3.5" is not a sentence end
+        #expect(p[1].hasSuffix("coming today."))
+    }
+
+    @Test func cutLandsInTheSilentGap() {
+        // 3 s of "speech" (noise) with 0.3 s of silence at 1.5–1.8 s.
+        var s = (0..<48_000).map { _ in Float.random(in: -0.3...0.3) }
+        for i in 24_000..<28_800 { s[i] = 0 }
+        let cut = ModelRecognizer.quietestPoint(s, from: 0, to: s.count)
+        #expect((24_000..<28_800).contains(cut))
+    }
+}

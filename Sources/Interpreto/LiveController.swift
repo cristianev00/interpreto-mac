@@ -420,28 +420,42 @@ final class LiveController {
         session.items.append(Utterance(id: id, source: text, start: offset + start, end: offset + end))
         draftPending = nil
         let d = direction
-        Task {
-            let t0 = Date()
-            let tr = await translate(text, d, before: id)
-            lastDelay = Date().timeIntervalSince(t0)
-            let translatedAt = Date()
-            Diagnostics.event(String(format: "TRANSLATED in %.2fs: %@", lastDelay ?? 0, tr))
-            update(id) { $0.translation = tr; $0.isTranslating = false }
-            if defaults.bool(forKey: Pref.speak), !tr.isEmpty {
-                let voiceKey = d == .enToZh ? Pref.voiceZH : Pref.voiceEN
-                Diagnostics.event("voice queued: \(tr)")
-                let spoken = speaker.speak(tr, language: d.targetVoiceLanguage,
-                                           voiceID: defaults.string(forKey: voiceKey),
-                                           outputUID: defaults.string(forKey: Pref.outputUID),
-                                           onStart: { [weak self] in
-                                               self?.speakingID = id
-                                               Diagnostics.event(String(format: "voice starts playing %.2fs after the translation", Date().timeIntervalSince(translatedAt)))
-                                           })
-                if !spoken { update(id) { $0.notSpoken = true } }
+        // In order: a later short sentence must not be shown or spoken before a long one.
+        let previous = translationChain
+        translationChain = Task {
+            await previous?.value
+            // Long sentences are translated (and spoken) piece by piece, so the first words
+            // arrive in about a second instead of after the whole paragraph.
+            let pieces = Translator.pieces(text, chinese: d == .zhToEn)
+            var parts: [String] = []
+            for (k, piece) in pieces.enumerated() {
+                let t0 = Date()
+                let tr = await translate(piece, d, before: id)
+                lastDelay = Date().timeIntervalSince(t0)
+                let translatedAt = Date()
+                let label = pieces.count > 1 ? " (piece \(k + 1) of \(pieces.count))" : ""
+                Diagnostics.event(String(format: "TRANSLATED in %.2fs%@: %@", lastDelay ?? 0, label, tr))
+                if !tr.isEmpty { parts.append(tr) }
+                let shown = parts.joined(separator: d == .zhToEn ? " " : "")
+                let last = k == pieces.count - 1
+                update(id) { $0.translation = shown; $0.isTranslating = !last }
+                if defaults.bool(forKey: Pref.speak), !tr.isEmpty {
+                    let voiceKey = d == .enToZh ? Pref.voiceZH : Pref.voiceEN
+                    Diagnostics.event("voice queued: \(tr)")
+                    let spoken = speaker.speak(tr, language: d.targetVoiceLanguage,
+                                               voiceID: defaults.string(forKey: voiceKey),
+                                               outputUID: defaults.string(forKey: Pref.outputUID),
+                                               onStart: { [weak self] in
+                                                   self?.speakingID = id
+                                                   Diagnostics.event(String(format: "voice starts playing %.2fs after the translation", Date().timeIntervalSince(translatedAt)))
+                                               })
+                    if !spoken { update(id) { $0.notSpoken = true } }
+                }
             }
             scheduleSave()
         }
     }
+    private var translationChain: Task<Void, Never>?
 
     /// Apple confirmed different wording for a sentence: show it and re-translate (not re-spoken).
     private func revised(_ id: UUID, _ heard: String) {

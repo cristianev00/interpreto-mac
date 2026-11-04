@@ -41,6 +41,29 @@ final class Translator {
         return tidy(out)
     }
 
+    /// Splits a long sentence at its sentence endings (。！？ or . ? ! followed by a space) into
+    /// pieces of at least `minimum` characters; short sentences stay whole.
+    nonisolated static func pieces(_ text: String, chinese: Bool, minimum: Int? = nil) -> [String] {
+        let min = minimum ?? (chinese ? 12 : 40)
+        guard text.count > min * 2 else { return [text] }
+        var out: [String] = [], current = ""
+        let chars = Array(text)
+        for (i, c) in chars.enumerated() {
+            current.append(c)
+            let ends = chinese ? "。！？!?".contains(c)
+                : ".?!".contains(c) && (i + 1 == chars.count || chars[i + 1] == " ")
+            if ends, current.trimmingCharacters(in: .whitespaces).count >= min {
+                out.append(current.trimmingCharacters(in: .whitespaces)); current = ""
+            }
+        }
+        let rest = current.trimmingCharacters(in: .whitespaces)
+        if !rest.isEmpty {
+            if rest.count < min, let lastPiece = out.popLast() { out.append(lastPiece + (chinese ? "" : " ") + rest) }
+            else { out.append(rest) }
+        }
+        return out.isEmpty ? [text] : out
+    }
+
     static func applyGlossary(_ text: String, terms: [(String, String)]) -> AttributedString {
         var out = AttributedString(text)
         guard !terms.isEmpty else { return out }

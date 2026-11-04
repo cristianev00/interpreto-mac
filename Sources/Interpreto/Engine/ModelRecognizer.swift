@@ -20,12 +20,16 @@ extension Recognizer: SpeechRecognizing {}
 ///
 /// The sentence in progress is re-transcribed about twice a second for the live words; when the
 /// speaker pauses it is transcribed once more and committed. A short pause ends a sentence that
-/// ends with . ? ! 。 ？ ！; a long pause ends it regardless; very long speech is cut at 20 s.
+/// ends with . ? ! 。 ？ ！; a long pause ends it regardless. Speech without pauses (a livestream,
+/// a fast talker) is cut after 6–10 s at its quietest moment, so a word is never split (7 s split
+/// ordinary long English sentences; 10 s keeps them whole). At 20 s,
+/// a recording of nonstop Mandarin waited ~20 s per piece plus ~6 s to translate 100 characters.
 @MainActor
 final class ModelRecognizer: SpeechRecognizing {
     static let rate = 16_000.0
     static let partialEvery = 0.5          // seconds of new audio between live updates
-    static let maxUtterance = 20.0         // seconds; longer speech is committed in parts
+    static let maxUtterance = 10.0         // seconds; longer speech is committed in parts…
+    static let cutSearch = 4.0             // …cut at the quietest moment of its last 4 s
     static let preRoll = 0.5               // seconds kept before speech starts
 
     let engine: SpeechEngine
@@ -131,7 +135,10 @@ final class ModelRecognizer: SpeechRecognizing {
         }
         let length = time - startTime
         if length >= Self.maxUtterance {
-            await commit(upTo: time)
+            let from = Int((length - Self.cutSearch) * Self.rate), to = samples.count - Int(0.3 * Self.rate)
+            let cut = Self.quietestPoint(samples, from: from, to: to)
+            Diagnostics.event(String(format: "no pause for %.1fs: cut at %.2fs", length, startTime + Double(cut) / Self.rate))
+            await commit(upTo: startTime + Double(cut) / Self.rate)
         } else if time - lastPartialAt >= Self.partialEvery, !busy {
             lastPartialAt = time
             await updatePartial()
@@ -236,6 +243,28 @@ final class ModelRecognizer: SpeechRecognizing {
     }
 
     static func clean(_ s: String) -> String { Recognizer.clean(s) }
+
+    /// The sample index in `from..<to` at the middle of the quietest 200 ms (10 frames of 20 ms):
+    /// the gap between two words, where cutting loses nothing.
+    nonisolated static func quietestPoint(_ samples: [Float], from: Int, to: Int) -> Int {
+        let frame = 320, window = 10
+        let lo = max(0, from), hi = min(samples.count, to)
+        guard hi - lo >= frame * window else { return hi }
+        var energy: [Float] = []
+        var i = lo
+        while i + frame <= hi {
+            var e: Float = 0
+            for j in i..<(i + frame) { e += samples[j] * samples[j] }
+            energy.append(e)
+            i += frame
+        }
+        var sum = energy[0..<window].reduce(0, +), best = sum, bestAt = 0
+        for k in window..<energy.count {
+            sum += energy[k] - energy[k - window]
+            if sum < best { best = sum; bestAt = k - window + 1 }
+        }
+        return lo + (bestAt + window / 2) * frame
+    }
 
     /// How loud the speech in `samples` is: the level of its loudest 20 ms stretches (90th
     /// percentile), so pauses don't lower it and a stretch containing the main speaker counts
