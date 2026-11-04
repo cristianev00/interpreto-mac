@@ -333,7 +333,7 @@ struct OutputMenu: View {
                 if zh {
                     Text("Matcha (natural)").tag("neural:matcha")
                 } else {
-                    ForEach(0..<10, id: \.self) { Text("\(VoicePack.supertonicName($0)) (natural)").tag("neural:supertonic:\($0)") }
+                    ForEach(VoicePack.paradeeVoices.indices, id: \.self) { Text("\(VoicePack.paradeeVoices[$0].1) (natural)").tag("neural:paradee:\($0)") }
                 }
                 Divider()
                 ForEach(Speaker.voices(for: live.direction.targetVoiceLanguage), id: \.identifier) {
@@ -354,7 +354,7 @@ struct OutputMenu: View {
         .help(speak ? "Speaking on \(live.outputName). Click to turn the voice off." : "Click to speak the translation aloud.")
         .onChange(of: speak) { _, on in live.speakingChanged(on) }
         .onChange(of: voiceZH) { _, v in if v.hasPrefix("neural:"), !VoicePack.matcha.isInstalled { ModelStore.shared.download(.matcha) } }
-        .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.supertonic.isInstalled { ModelStore.shared.download(.supertonic) } }
+        .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.paradee.isInstalled { ModelStore.shared.download(.paradee) } }
     }
 }
 

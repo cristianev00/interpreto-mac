@@ -29,7 +29,7 @@ enum Entry {
         if let i = args.firstIndex(of: "--speakfile") {      // --speakfile en|zh lines.txt outdir: one wav per line
             Task { @MainActor in
                 let zh = args[i + 1] == "zh"
-                let spec = VoicePack.spec(for: zh ? "neural:matcha" : "neural:supertonic:5")!
+                let spec = VoicePack.spec(for: zh ? "neural:matcha" : "neural:paradee:0")!
                 let lines = ((try? String(contentsOfFile: args[i + 2], encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
                 for (k, line) in lines.enumerated() {
                     guard let out = await VoiceEngine.shared.synthesize(line, spec) else { continue }
@@ -104,7 +104,7 @@ enum Entry {
                 print(String(format: "memory at start: %.0f MB", rss()))
                 let tests: [(String, String)] = [
                     ("neural:matcha", "在目睹了第一次世界大战期间的恐怖与暴行之后，各国都希望在未来避免再发生类似的情况。"),
-                    ("neural:supertonic:0", "After seeing the horrors and atrocities of war during World War One, nations desired to avoid such a situation again in the future."),
+                    ("neural:paradee:0", "After seeing the horrors and atrocities of war during World War One, nations desired to avoid such a situation again in the future."),
                 ]
                 for (id, text) in tests {
                     guard let spec = VoicePack.spec(for: id) else { continue }

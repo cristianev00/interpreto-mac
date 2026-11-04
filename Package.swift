@@ -13,7 +13,7 @@ let package = Package(
     platforms: [.macOS("26.4")],
     dependencies: [
         // Parakeet speech recognition on the Neural Engine (Apache-2.0).
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.17.4"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.18.2"),
     ],
     targets: [
         .systemLibrary(name: "SherpaOnnxC", path: "Vendor/SherpaOnnxC"),

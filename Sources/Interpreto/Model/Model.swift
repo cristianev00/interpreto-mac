@@ -88,6 +88,11 @@ enum Pref {
         let d = UserDefaults.standard
         if d.string(forKey: engineZH) == "funasr" { d.set(SpeechEngine.sensevoice.rawValue, forKey: engineZH) }
         d.removeObject(forKey: "translatorZH")
+        // Supertonic was replaced by Paradee (as clear, ~5× smaller, ~8× faster).
+        if let v = d.string(forKey: voiceEN), v.hasPrefix("neural:supertonic:") {
+            let sid = Int(v.split(separator: ":").last ?? "") ?? 0
+            d.set(sid < 5 ? "neural:paradee:0" : "neural:paradee:2", forKey: voiceEN)
+        }
         UserDefaults.standard.register(defaults: [
             direction: Direction.enToZh.rawValue, speak: false, textSize: 24.0,
             showOriginal: true, livePreview: true, glossary: "",

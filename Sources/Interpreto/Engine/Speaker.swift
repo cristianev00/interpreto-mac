@@ -120,7 +120,7 @@ final class Speaker {
     /// "Automatic": the natural voice when it's downloaded, otherwise Apple's best.
     static func automaticVoice(_ language: String) -> String? {
         if language.hasPrefix("zh") { return VoicePack.matcha.isInstalled ? "neural:matcha" : nil }
-        return VoicePack.supertonic.isInstalled ? "neural:supertonic:0" : nil
+        return VoicePack.paradee.isInstalled ? "neural:paradee:0" : nil
     }
 
     /// Synthesizes clause by clause, in order, so the first words play as soon as they're ready.

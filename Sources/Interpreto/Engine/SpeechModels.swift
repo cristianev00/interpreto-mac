@@ -64,6 +64,19 @@ final class ModelStore {
     func download(_ p: VoicePack) {
         if case .downloading = state(p) { return }
         voiceStates[p] = .downloading(0)
+        if p == .paradee {
+            Task {
+                do {
+                    voiceStates[p] = .downloading(0.5)          // FluidAudio reports no progress; ~25 MB
+                    _ = try await VoiceEngine.shared.loadParadee()
+                    FileManager.default.createFile(atPath: VoicePack.paradeeReady.path, contents: Data())
+                    voiceStates[p] = .installed
+                } catch {
+                    voiceStates[p] = .failed(error.localizedDescription)
+                }
+            }
+            return
+        }
         Task {
             do {
                 let dir = VoicePack.folderURL

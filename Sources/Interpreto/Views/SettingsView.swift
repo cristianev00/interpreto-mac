@@ -104,13 +104,13 @@ private struct AudioSettings: View {
                     Picker("English voice", selection: $voiceEN) {
                         Text("Automatic").tag("")
                         Section("Natural") {
-                            ForEach(0..<10, id: \.self) { Text(VoicePack.supertonicName($0)).tag("neural:supertonic:\($0)") }
+                            ForEach(VoicePack.paradeeVoices.indices, id: \.self) { Text(VoicePack.paradeeVoices[$0].1).tag("neural:paradee:\($0)") }
                         }
                         Section("Apple") {
                             ForEach(Speaker.voices(for: "en-US"), id: \.identifier) { Text(Speaker.label($0)).tag($0.identifier) }
                         }
                     }
-                    .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.supertonic.isInstalled { store.download(.supertonic) } }
+                    .onChange(of: voiceEN) { _, v in if v.hasPrefix("neural:"), !VoicePack.paradee.isInstalled { store.download(.paradee) } }
                     ForEach(VoicePack.allCases) { pack in packRow(pack) }
                 }
                 .disabled(!speak)
